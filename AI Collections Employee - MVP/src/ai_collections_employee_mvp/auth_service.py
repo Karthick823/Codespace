@@ -15,10 +15,11 @@ import secrets
 import sqlite3
 from contextlib import closing
 from datetime import datetime, timedelta, timezone
-from pathlib import Path
 from typing import Any
 
-DB_PATH = Path(__file__).resolve().parent / "collection_workflow.db"
+from database_config import DEFAULT_DB_PATH
+
+DB_PATH = DEFAULT_DB_PATH
 
 ROLES = ("admin", "reviewer", "collector", "viewer")
 ITERATIONS = 310_000

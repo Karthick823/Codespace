@@ -4,9 +4,10 @@ from __future__ import annotations
 import json
 import sqlite3
 from datetime import datetime, timezone
-from pathlib import Path
 
-DB_PATH = Path(__file__).resolve().parent / "collection_workflow.db"
+from database_config import DEFAULT_DB_PATH
+
+DB_PATH = DEFAULT_DB_PATH
 
 def _connect():
     conn=sqlite3.connect(str(DB_PATH), timeout=15); conn.row_factory=sqlite3.Row; return conn
