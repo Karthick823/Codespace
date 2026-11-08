@@ -1,0 +1,105 @@
+"""V3.4 local authentication and role service.
+
+Uses PBKDF2-HMAC-SHA256 password hashes and constant-time verification. For local prototype only;
+production deployments should use enterprise SSO/identity provider and server-side session controls.
+"""
+from __future__ import annotations
+import hashlib, hmac, os, re, secrets, sqlite3
+from datetime import datetime, timezone
+from pathlib import Path
+
+DB_PATH = Path(__file__).resolve().parent / "collection_workflow.db"
+ROLES = ("admin", "reviewer", "collector", "viewer")
+ITERATIONS = 310_000
+
+def _connect():
+    conn = sqlite3.connect(str(DB_PATH), timeout=15)
+    conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA foreign_keys=ON")
+    return conn
+
+def _now(): return datetime.now(timezone.utc).isoformat(timespec="seconds")
+
+def initialize_auth():
+    with _connect() as db:
+        db.execute("""CREATE TABLE IF NOT EXISTS app_users (
+            id INTEGER PRIMARY KEY AUTOINCREMENT, username TEXT NOT NULL UNIQUE COLLATE NOCASE,
+            display_name TEXT NOT NULL, role TEXT NOT NULL CHECK(role IN ('admin','reviewer','collector','viewer')),
+            password_salt TEXT NOT NULL, password_hash TEXT NOT NULL,
+            is_active INTEGER NOT NULL DEFAULT 1, created_at TEXT NOT NULL, created_by TEXT NOT NULL,
+            updated_at TEXT NOT NULL, failed_attempts INTEGER NOT NULL DEFAULT 0,
+            locked_until TEXT
+        )""")
+        db.execute("CREATE INDEX IF NOT EXISTS idx_app_users_active ON app_users(is_active, username)")
+
+def _hash_password(password: str, salt: bytes | None = None) -> tuple[str, str]:
+    if not isinstance(password, str) or len(password) < 12:
+        raise ValueError("Password must be at least 12 characters.")
+    if len(password) > 256:
+        raise ValueError("Password must not exceed 256 characters.")
+    salt = salt or secrets.token_bytes(16)
+    digest = hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"), salt, ITERATIONS)
+    return salt.hex(), digest.hex()
+
+def create_user(username, password, role, display_name=None, created_by="bootstrap"):
+    initialize_auth()
+    username = str(username or "").strip()
+    if not re.fullmatch(r"[A-Za-z0-9_.-]{3,80}", username):
+        raise ValueError("Username must be 3-80 characters: letters, numbers, dot, underscore, hyphen.")
+    if role not in ROLES: raise ValueError("Unsupported role.")
+    salt, digest = _hash_password(password)
+    display_name = str(display_name or username).strip()[:120]
+    if not display_name: raise ValueError("Display name is required.")
+    with _connect() as db:
+        cur = db.execute("""INSERT INTO app_users(username,display_name,role,password_salt,password_hash,
+            is_active,created_at,created_by,updated_at) VALUES(?,?,?,?,?,1,?,?,?)""",
+            (username, display_name, role, salt, digest, _now(), str(created_by)[:80], _now()))
+        return cur.lastrowid
+
+def list_users():
+    initialize_auth()
+    with _connect() as db:
+        return [dict(r) for r in db.execute("SELECT id,username,display_name,role,is_active,created_at,created_by,updated_at,failed_attempts,locked_until FROM app_users ORDER BY id").fetchall()]
+
+def set_user_active(username, active, changed_by="admin"):
+    initialize_auth()
+    with _connect() as db:
+        cur = db.execute("UPDATE app_users SET is_active=?,updated_at=? WHERE username=? COLLATE NOCASE", (1 if active else 0, _now(), str(username)))
+        if cur.rowcount != 1: raise ValueError("User not found.")
+
+def authenticate(username, password):
+    initialize_auth()
+    username = str(username or "").strip()[:80]
+    with _connect() as db:
+        row = db.execute("SELECT * FROM app_users WHERE username=? COLLATE NOCASE", (username,)).fetchone()
+        if row is None:
+            # Reduce obvious timing difference for nonexistent usernames.
+            hashlib.pbkdf2_hmac("sha256", str(password or "").encode(), b"fixed-dummy-salt", 30_000)
+            return None
+        if not row["is_active"]: return None
+        if row["locked_until"] and row["locked_until"] > _now(): return None
+        try:
+            candidate = hashlib.pbkdf2_hmac("sha256", str(password or "").encode(), bytes.fromhex(row["password_salt"]), ITERATIONS).hex()
+        except Exception:
+            return None
+        if not hmac.compare_digest(candidate, row["password_hash"]):
+            failures = int(row["failed_attempts"]) + 1
+            locked_until = None
+            if failures >= 5:
+                from datetime import timedelta
+                locked_until = (datetime.now(timezone.utc) + timedelta(minutes=15)).isoformat(timespec="seconds")
+                failures = 0
+            db.execute("UPDATE app_users SET failed_attempts=?,locked_until=?,updated_at=? WHERE id=?", (failures, locked_until, _now(), row["id"]))
+            return None
+        db.execute("UPDATE app_users SET failed_attempts=0,locked_until=NULL,updated_at=? WHERE id=?", (_now(), row["id"]))
+        return {"id": row["id"], "username": row["username"], "display_name": row["display_name"], "role": row["role"]}
+
+def current_user():
+    import streamlit as st
+    user = st.session_state.get("v34_user")
+    if not isinstance(user, dict) or user.get("role") not in ROLES: return None
+    return user
+
+def logout():
+    import streamlit as st
+    st.session_state.pop("v34_user", None)

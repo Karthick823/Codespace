@@ -1,0 +1,347 @@
+"""V3.1 durable, resumable multi-step collection workflow orchestration.
+
+This is a bounded workflow engine, not an autonomous financial decision-maker.
+It checkpoints each step in SQLite and resumes completed workflows from the last
+incomplete step. External actions remain disabled.
+"""
+from __future__ import annotations
+
+import json
+import sqlite3
+import uuid
+from datetime import date, datetime
+from pathlib import Path
+from typing import Any
+
+from approval_service import list_requests
+from collection_agent_v3_5 import (
+    AgentWorkflowError,
+    classify_customer_reply,
+    create_follow_up_task,
+    evaluate_collection_rules,
+    get_invoice_details,
+    submit_human_approval,  # noqa: F401
+)
+from follow_up_service import list_tasks
+from secure_workflow_service import create_approval_request, require_permission
+from workflow_reliability_service import (
+    execution_lease,
+    initialize_reliability,
+    log_reliability_event,
+    resolve_idempotency_key,
+)
+
+DB_PATH = Path(__file__).resolve().parent / "collection_workflow.db"
+STEP_ORDER = (
+    ("retrieve_invoice", "Retrieve invoice details"),
+    ("classify_response", "Classify customer response"),
+    ("evaluate_rules", "Evaluate deterministic collection rules"),
+    ("create_task", "Create follow-up task"),
+    ("submit_approval", "Submit human approval request"),
+)
+
+
+def _connect():
+    db = sqlite3.connect(DB_PATH, timeout=15)
+    db.row_factory = sqlite3.Row
+    db.execute("PRAGMA foreign_keys = ON")
+    return db
+
+
+def _now():
+    return datetime.now().isoformat(timespec="seconds")
+
+
+def _json(value):
+    return json.dumps(value, ensure_ascii=False, default=str)
+
+
+def initialize():
+    initialize_reliability()
+    with _connect() as db:
+        db.execute("""CREATE TABLE IF NOT EXISTS workflow_runs (
+            workflow_id TEXT PRIMARY KEY,
+            invoice_number TEXT NOT NULL,
+            requested_by TEXT NOT NULL,
+            customer_response TEXT,
+            follow_up_date TEXT NOT NULL,
+            status TEXT NOT NULL,
+            current_step TEXT,
+            result_json TEXT,
+            error_message TEXT,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        )""")
+        db.execute("""CREATE TABLE IF NOT EXISTS workflow_steps (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            workflow_id TEXT NOT NULL,
+            step_key TEXT NOT NULL,
+            step_name TEXT NOT NULL,
+            status TEXT NOT NULL,
+            output_json TEXT,
+            error_message TEXT,
+            started_at TEXT,
+            completed_at TEXT,
+            UNIQUE(workflow_id, step_key),
+            FOREIGN KEY(workflow_id) REFERENCES workflow_runs(workflow_id)
+        )""")
+
+
+def create_workflow(invoice_number: str, requested_by: str,
+                    customer_response: str | None = None,
+                    follow_up_date: date | None = None,
+                    idempotency_key: str | None = None,
+                    request_id: str | None = None) -> str:
+    invoice_number = str(invoice_number).strip()
+    requested_by = str(requested_by).strip()
+    if not invoice_number:
+        raise ValueError("Invoice number is required.")
+    if not requested_by:
+        raise ValueError("Requester name/team is required.")
+    response = (str(customer_response).strip() if customer_response else None)
+    if response and len(response) > 12000:
+        raise ValueError("Customer response must be 12,000 characters or fewer.")
+    due = follow_up_date or date.today()
+    initialize()
+    payload = {"invoice_number": invoice_number, "requested_by": requested_by,
+               "customer_response": response, "follow_up_date": due.isoformat()}
+    workflow_id = str(uuid.uuid4())
+    if idempotency_key:
+        workflow_id, is_new = resolve_idempotency_key(idempotency_key, payload, workflow_id)
+        if not is_new:
+            log_reliability_event(workflow_id, "idempotent_replay", requested_by, request_id,
+                                  {"result": "existing_workflow_returned"})
+            return workflow_id
+    now = _now()
+    try:
+        with _connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            db.execute("""INSERT INTO workflow_runs
+                (workflow_id, invoice_number, requested_by, customer_response,
+                 follow_up_date, status, current_step, created_at, updated_at)
+                VALUES (?, ?, ?, ?, ?, 'Queued', NULL, ?, ?)""",
+                (workflow_id, invoice_number, requested_by, response, due.isoformat(), now, now))
+            for key, name in STEP_ORDER:
+                db.execute("""INSERT INTO workflow_steps
+                    (workflow_id, step_key, step_name, status) VALUES (?, ?, ?, 'Pending')""",
+                    (workflow_id, key, name))
+            db.commit()
+    except Exception:
+        # Remove an idempotency mapping if the corresponding workflow could not be created.
+        if idempotency_key:
+            with _connect() as db:
+                db.execute("DELETE FROM workflow_idempotency WHERE idempotency_key=? AND workflow_id=?",
+                           (idempotency_key, workflow_id))
+        raise
+    log_reliability_event(workflow_id, "workflow_created", requested_by, request_id,
+                          {"invoice_number": invoice_number, "status": "Queued"})
+    return workflow_id
+
+
+def get_workflow(workflow_id: str) -> dict[str, Any] | None:
+    initialize()
+    with _connect() as db:
+        row = db.execute("SELECT * FROM workflow_runs WHERE workflow_id=?", (workflow_id,)).fetchone()
+    if not row:
+        return None
+    result = dict(row)
+    if result.get("result_json"):
+        result["result"] = json.loads(result["result_json"])
+    else:
+        result["result"] = None
+    result.pop("result_json", None)
+    return result
+
+
+def list_workflows(limit: int = 100) -> list[dict[str, Any]]:
+    initialize()
+    limit = max(1, min(int(limit), 500))
+    with _connect() as db:
+        rows = db.execute("SELECT * FROM workflow_runs ORDER BY created_at DESC LIMIT ?", (limit,)).fetchall()
+    results=[]
+    for row in rows:
+        item=dict(row)
+        item.pop("customer_response", None)  # don't display stored message text in the history table
+        item.pop("result_json", None)
+        results.append(item)
+    return results
+
+
+def list_workflow_steps(workflow_id: str) -> list[dict[str, Any]]:
+    initialize()
+    with _connect() as db:
+        rows = db.execute("SELECT * FROM workflow_steps WHERE workflow_id=? ORDER BY id", (workflow_id,)).fetchall()
+    results=[]
+    for row in rows:
+        item=dict(row)
+        if item.get("output_json"):
+            item["output"] = json.loads(item["output_json"])
+        else:
+            item["output"] = None
+        item.pop("output_json", None)
+        results.append(item)
+    return results
+
+
+def _load_step(workflow_id: str, key: str):
+    with _connect() as db:
+        row=db.execute("SELECT * FROM workflow_steps WHERE workflow_id=? AND step_key=?", (workflow_id,key)).fetchone()
+    if row and row["status"] == "Completed" and row["output_json"] is not None:
+        return json.loads(row["output_json"])
+    return None
+
+
+def _start_step(workflow_id: str, key: str):
+    now=_now()
+    with _connect() as db:
+        db.execute("UPDATE workflow_steps SET status='Running', error_message=NULL, started_at=?, completed_at=NULL WHERE workflow_id=? AND step_key=?", (now,workflow_id,key))
+        db.execute("UPDATE workflow_runs SET status='Running', current_step=?, error_message=NULL, updated_at=? WHERE workflow_id=?", (key,now,workflow_id))
+
+
+def _complete_step(workflow_id: str, key: str, output: Any):
+    now=_now()
+    with _connect() as db:
+        db.execute("UPDATE workflow_steps SET status='Completed', output_json=?, error_message=NULL, completed_at=? WHERE workflow_id=? AND step_key=?", (_json(output),now,workflow_id,key))
+        db.execute("UPDATE workflow_runs SET updated_at=? WHERE workflow_id=?", (now,workflow_id))
+
+
+def _fail_step(workflow_id: str, key: str, error: Exception):
+    now=_now()
+    message=f"{type(error).__name__}: {error}"[:1500]
+    with _connect() as db:
+        db.execute("UPDATE workflow_steps SET status='Failed', error_message=?, completed_at=? WHERE workflow_id=? AND step_key=?", (message,now,workflow_id,key))
+        db.execute("UPDATE workflow_runs SET status='Failed', current_step=?, error_message=?, updated_at=? WHERE workflow_id=?", (key,message,now,workflow_id))
+
+
+def _persist_result(workflow_id: str, status: str, result: dict[str, Any] | None = None, error: str | None = None):
+    with _connect() as db:
+        db.execute("UPDATE workflow_runs SET status=?, result_json=?, error_message=?, updated_at=? WHERE workflow_id=?",
+                   (status, _json(result) if result is not None else None, error, _now(), workflow_id))
+
+
+def _recover_side_effect_ids(workflow_id: str, invoice_number: str, requested_by: str):
+    """Recover task/approval IDs if a process stopped after a side effect committed but before checkpointing."""
+    marker=f"V3.1 workflow ID: {workflow_id}."
+    tasks=list_tasks()
+    task=next((t for t in tasks if t.get("invoice_number")==invoice_number and marker in str(t.get("description", ""))), None)
+    approval=next((a for a in list_requests("All") if a.get("invoice_number")==invoice_number and marker in str(a.get("rationale", "")) and a.get("requested_by")==requested_by), None)
+    return (int(task["id"]) if task else None, int(approval["id"]) if approval else None)
+
+
+def _run_or_resume_workflow_unleased(workflow_id: str, invoices, actor: dict | None = None) -> dict[str, Any]:
+    """Run or resume a workflow from durable step checkpoints.
+
+    A completed step is not repeated. Before creating a task or approval, the engine
+    searches for a record carrying this workflow's unique marker to recover from a
+    process interruption between the database write and checkpoint write.
+    """
+    actor = require_permission(actor, "run_workflow")
+    run=get_workflow(workflow_id)
+    if not run:
+        raise ValueError("Workflow ID was not found.")
+    if actor.get("role") != "admin" and run.get("requested_by") != actor.get("username"):
+        raise PermissionError("You may only run or resume workflows that you created.")
+    if run["status"] == "Completed" and run.get("result"):
+        return run["result"]
+
+    invoice_number=run["invoice_number"]
+    requested_by=run["requested_by"]
+    follow_up_date=date.fromisoformat(run["follow_up_date"])
+    response=run.get("customer_response")
+    outputs={}
+
+    try:
+        outputs["invoice"]=_load_step(workflow_id,"retrieve_invoice")
+        if outputs["invoice"] is None:
+            _start_step(workflow_id,"retrieve_invoice")
+            outputs["invoice"]=get_invoice_details(invoices,invoice_number)
+            _complete_step(workflow_id,"retrieve_invoice",outputs["invoice"])
+
+        outputs["classification"]=_load_step(workflow_id,"classify_response")
+        if outputs["classification"] is None:
+            _start_step(workflow_id,"classify_response")
+            outputs["classification"]=classify_customer_reply(response)
+            _complete_step(workflow_id,"classify_response",outputs["classification"])
+
+        outputs["decision"]=_load_step(workflow_id,"evaluate_rules")
+        if outputs["decision"] is None:
+            _start_step(workflow_id,"evaluate_rules")
+            outputs["decision"]=evaluate_collection_rules(outputs["invoice"],outputs["classification"])
+            _complete_step(workflow_id,"evaluate_rules",outputs["decision"])
+
+        outputs["task_id"]=_load_step(workflow_id,"create_task")
+        if outputs["task_id"] is None:
+            _start_step(workflow_id,"create_task")
+            recovered_task, _ = _recover_side_effect_ids(workflow_id,invoice_number,requested_by)
+            if recovered_task is None:
+                decision=outputs["decision"]
+                action_map={"Dispute review":"Review invoice dispute","Payment verification":"Verify reported payment","Invoice resend review":"Resend invoice","Supporting documents":"Provide supporting documents","Payment promise tracking":"Review payment promise","Reminder draft eligible":"Prepare payment reminder","Monitor":"Contact customer","No collection required":"Other"}
+                description=(f"V3.1 workflow ID: {workflow_id}. V3.1 orchestrated recommendation: {decision['decision']}. "
+                    f"{decision['recommended_action']} Reason: {decision['reason']} Human review required; no external action executed.")
+                if outputs["classification"]:
+                    description += f" Response category: {outputs['classification']['category']}; sentiment: {outputs['classification']['sentiment']}."
+                task_id=create_follow_up_task(outputs["invoice"],decision,outputs["classification"],follow_up_date)
+                # Append workflow marker through task description isn't possible in legacy API; update record safely.
+                with _connect() as db:
+                    db.execute("UPDATE follow_up_tasks SET description=? WHERE id=?", (description[:1000],task_id))
+                outputs["task_id"]=task_id
+            else:
+                outputs["task_id"]=recovered_task
+            _complete_step(workflow_id,"create_task",outputs["task_id"])
+
+        outputs["approval_id"]=_load_step(workflow_id,"submit_approval")
+        if outputs["approval_id"] is None:
+            _start_step(workflow_id,"submit_approval")
+            _, recovered_approval = _recover_side_effect_ids(workflow_id,invoice_number,requested_by)
+            if recovered_approval is None:
+                decision=outputs["decision"]
+                action_map={"Dispute review":"Review invoice dispute","Payment verification":"Verify reported payment","Invoice resend review":"Prepare invoice resend","Supporting documents":"Prepare supporting documents","Payment promise tracking":"Track payment promise","Reminder draft eligible":"Prepare payment reminder","Monitor":"Other","No collection required":"Other"}
+                rationale=(f"V3.1 workflow ID: {workflow_id}. Linked follow-up task ID: {outputs['task_id']}. "
+                    f"Decision: {decision['decision']}. Reason: {decision['reason']} Recommended action: {decision['recommended_action']} "
+                    f"Reminder permitted by deterministic rules: {decision['reminder_allowed']}. Human approval required. "
+                    "No email, payment, or accounting update was executed.")
+                approval_id=create_approval_request(actor, invoice_number, action_map.get(decision["decision"],"Other"), rationale, workflow_id=workflow_id, task_id=int(outputs["task_id"]))
+                outputs["approval_id"]=int(approval_id)
+            else:
+                outputs["approval_id"]=recovered_approval
+            _complete_step(workflow_id,"submit_approval",outputs["approval_id"])
+
+        result={"workflow_id":workflow_id,"workflow_status":"Completed — awaiting human approval",
+            "invoice":outputs["invoice"],"classification":outputs["classification"],"decision":outputs["decision"],
+            "follow_up_task_id":int(outputs["task_id"]),"approval_request_id":int(outputs["approval_id"]),
+            "external_action_executed":False,"step_trace":list_workflow_steps(workflow_id)}
+        _persist_result(workflow_id,"Completed",result)
+        return result
+    except Exception as error:
+        # Mark the first currently-running step failed; preserve all completed checkpoints.
+        with _connect() as db:
+            row=db.execute("SELECT step_key FROM workflow_steps WHERE workflow_id=? AND status='Running' ORDER BY id LIMIT 1",(workflow_id,)).fetchone()
+        if row:
+            _fail_step(workflow_id,row["step_key"],error)
+        else:
+            _persist_result(workflow_id,"Failed",error=f"{type(error).__name__}: {error}"[:1500])
+        raise AgentWorkflowError(f"Workflow {workflow_id} stopped safely: {type(error).__name__}: {error}. Completed steps are saved. Use Resume on this workflow after resolving the issue.") from error
+
+
+def run_or_resume_workflow(workflow_id: str, invoices, actor: dict | None = None) -> dict[str, Any]:
+    """Reliability wrapper: authorization, single active execution, and start/failure/recovery/completion events."""
+    actor = require_permission(actor, "run_workflow")
+    owner = str(actor.get("username") or actor.get("id") or "unknown")
+    log_reliability_event(workflow_id, "workflow_run_requested", owner,
+                          details={"actor_role": actor.get("role", "")})
+    try:
+        with execution_lease(workflow_id, owner):
+            current = get_workflow(workflow_id)
+            if current is None:
+                raise ValueError("Workflow ID was not found.")
+            if current.get("status") == "Failed":
+                log_reliability_event(workflow_id, "workflow_recovery_started", owner,
+                                      details={"previous_step": current.get("current_step")})
+            result = _run_or_resume_workflow_unleased(workflow_id, invoices, actor=actor)
+            log_reliability_event(workflow_id, "workflow_run_succeeded", owner,
+                                  details={"status": get_workflow(workflow_id).get("status")})
+            return result
+    except Exception as error:
+        log_reliability_event(workflow_id, "workflow_run_failed_or_blocked", owner,
+                              details={"error_type": type(error).__name__, "error": str(error)[:500]})
+        raise

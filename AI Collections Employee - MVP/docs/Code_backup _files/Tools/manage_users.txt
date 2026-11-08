@@ -1,0 +1,40 @@
+"""Command-line user bootstrap/administration for local V3.4 prototype.
+
+Examples:
+  python manage_users.py bootstrap-admin
+  python manage_users.py create-user --username reviewer1 --role reviewer --display-name "AR Reviewer"
+  python manage_users.py list-users
+  python manage_users.py deactivate-user --username reviewer1
+Passwords are prompted securely; never put them on the command line.
+"""
+import argparse, getpass, sys
+from auth_service import create_user, list_users, set_user_active, initialize_auth
+
+def main():
+    p=argparse.ArgumentParser(description="AI Collections Employee local account administration")
+    sub=p.add_subparsers(dest="command", required=True)
+    sub.add_parser("bootstrap-admin")
+    c=sub.add_parser("create-user"); c.add_argument("--username",required=True); c.add_argument("--role",choices=["admin","reviewer","collector","viewer"],required=True); c.add_argument("--display-name",default=None)
+    sub.add_parser("list-users")
+    d=sub.add_parser("deactivate-user"); d.add_argument("--username",required=True)
+    a=p.parse_args(); initialize_auth()
+    if a.command in ("bootstrap-admin","create-user"):
+        if a.command=="bootstrap-admin" and any(u["role"]=="admin" for u in list_users()):
+            print("An administrator already exists. Use create-user to add another account."); return 2
+        username = input("Admin username: ").strip() if a.command=="bootstrap-admin" else a.username
+        role="admin" if a.command=="bootstrap-admin" else a.role
+        display=input("Display name: ").strip() if a.command=="bootstrap-admin" else a.display_name
+        pw=getpass.getpass("Password (minimum 12 characters): "); confirm=getpass.getpass("Confirm password: ")
+        if pw != confirm: print("Passwords do not match."); return 2
+        try:
+            uid=create_user(username,pw,role,display,created_by="cli-bootstrap")
+            print(f"Created {role} account {username!r} (ID {uid}). Keep the password private."); return 0
+        except Exception as e: print(f"Could not create account: {type(e).__name__}: {e}"); return 2
+    if a.command=="list-users":
+        for u in list_users(): print(f"{u['id']} | {u['username']} | {u['role']} | active={bool(u['is_active'])} | created={u['created_at']}")
+        return 0
+    if a.command=="deactivate-user":
+        try: set_user_active(a.username,False,changed_by="cli"); print(f"Deactivated {a.username}"); return 0
+        except Exception as e: print(f"Could not deactivate: {type(e).__name__}: {e}"); return 2
+    return 0
+if __name__=="__main__": sys.exit(main())

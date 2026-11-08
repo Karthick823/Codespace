@@ -1,0 +1,664 @@
+from datetime import date, datetime
+from pathlib import Path
+import sqlite3
+
+import pandas as pd
+import plotly.express as px
+import streamlit as st
+
+# ------------------------------------------------------------
+# Page configuration
+# ------------------------------------------------------------
+st.set_page_config(
+    page_title="AI Collections Employee",
+    page_icon="📊",
+    layout="wide",
+)
+
+st.title("AI Collections Employee")
+st.caption("Accounts Receivable Intelligence Dashboard")
+
+
+# ------------------------------------------------------------
+# Configuration
+# ------------------------------------------------------------
+REQUIRED_COLUMNS = [
+    "invoice_number",
+    "customer_name",
+    "customer_email",
+    "invoice_date",
+    "due_date",
+    "invoice_amount",
+    "outstanding_amount",
+    "dispute_status",
+]
+
+SAMPLE_FILE = Path(__file__).resolve().parent / "sample_invoices.csv"
+ACTIVITY_DB = Path(__file__).resolve().parent / "collection_activity.db"
+
+
+def init_activity_db() -> None:
+    """Create a local persistent activity log for the MVP."""
+    with sqlite3.connect(ACTIVITY_DB) as connection:
+        connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS collection_activity (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                created_at TEXT NOT NULL,
+                invoice_number TEXT NOT NULL,
+                customer_name TEXT NOT NULL,
+                activity_type TEXT NOT NULL,
+                status TEXT NOT NULL,
+                subject TEXT DEFAULT '',
+                body TEXT DEFAULT '',
+                tone TEXT DEFAULT '',
+                recommended_action TEXT DEFAULT '',
+                follow_up_date TEXT DEFAULT '',
+                notes TEXT DEFAULT ''
+            )
+            """
+        )
+        connection.commit()
+
+
+def record_activity(
+    *, invoice_number: str, customer_name: str, activity_type: str,
+    status: str, subject: str = '', body: str = '', tone: str = '',
+    recommended_action: str = '', follow_up_date: str = '', notes: str = ''
+) -> None:
+    """Persist a collection event. This function never sends email."""
+    with sqlite3.connect(ACTIVITY_DB) as connection:
+        connection.execute(
+            """
+            INSERT INTO collection_activity (
+                created_at, invoice_number, customer_name, activity_type,
+                status, subject, body, tone, recommended_action,
+                follow_up_date, notes
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                datetime.now().astimezone().isoformat(timespec='seconds'),
+                str(invoice_number), str(customer_name), str(activity_type),
+                str(status), str(subject), str(body), str(tone),
+                str(recommended_action), str(follow_up_date), str(notes),
+            ),
+        )
+        connection.commit()
+
+
+def load_activity() -> pd.DataFrame:
+    """Return the newest collection activities from the local database."""
+    with sqlite3.connect(ACTIVITY_DB) as connection:
+        return pd.read_sql_query(
+            "SELECT id, created_at, invoice_number, customer_name, activity_type, "
+            "status, tone, recommended_action, follow_up_date, notes "
+            "FROM collection_activity ORDER BY id DESC LIMIT 500",
+            connection,
+        )
+
+
+init_activity_db()
+
+
+# ------------------------------------------------------------
+# Data processing
+# ------------------------------------------------------------
+def process_invoices(data: pd.DataFrame) -> pd.DataFrame:
+    """Validate invoice data and calculate aging and priority fields."""
+    if data is None or data.empty:
+        raise ValueError("The invoice file is empty. Please upload data rows.")
+
+    data = data.copy()
+
+    # Normalize column names, including accidental surrounding spaces.
+    data.columns = [str(column).strip().lower() for column in data.columns]
+
+    missing_columns = [
+        column for column in REQUIRED_COLUMNS if column not in data.columns
+    ]
+    if missing_columns:
+        raise ValueError(
+            "Missing required columns: " + ", ".join(missing_columns)
+        )
+
+    # Normalize text fields.
+    for column in ["invoice_number", "customer_name", "customer_email", "dispute_status"]:
+        data[column] = data[column].fillna("").astype(str).str.strip()
+
+    # Normalize dates and amounts.
+    for column in ["invoice_date", "due_date"]:
+        data[column] = pd.to_datetime(data[column], errors="coerce")
+
+    for column in ["invoice_amount", "outstanding_amount"]:
+        # Accept values such as "₹1,500" as well as plain numbers.
+        cleaned = (
+            data[column]
+            .astype(str)
+            .str.replace(",", "", regex=False)
+            .str.replace("₹", "", regex=False)
+            .str.strip()
+        )
+        data[column] = pd.to_numeric(cleaned, errors="coerce")
+
+    # Required-field validation.
+    invalid = (
+        data["invoice_number"].eq("")
+        | data["customer_name"].eq("")
+        | data["due_date"].isna()
+        | data["invoice_amount"].isna()
+        | data["outstanding_amount"].isna()
+        | data["invoice_amount"].lt(0)
+        | data["outstanding_amount"].lt(0)
+        | data["outstanding_amount"].gt(data["invoice_amount"])
+    )
+
+    if invalid.any():
+        bad_rows = (data.index[invalid] + 2).tolist()[:10]
+        row_text = ", ".join(map(str, bad_rows))
+        raise ValueError(
+            f"{int(invalid.sum())} row(s) have missing or invalid required values. "
+            f"Example CSV row number(s): {row_text}."
+        )
+
+    # Invoice numbers should be unique within this uploaded file.
+    duplicates = data["invoice_number"].duplicated(keep=False)
+    if duplicates.any():
+        duplicate_ids = (
+            data.loc[duplicates, "invoice_number"].drop_duplicates().tolist()[:10]
+        )
+        raise ValueError(
+            "Duplicate invoice number(s) detected: "
+            + ", ".join(duplicate_ids)
+            + ". Please resolve duplicates before analysis."
+        )
+
+    # Use today's local system date to calculate overdue days.
+    today = pd.Timestamp(date.today())
+    due_dates = data["due_date"].dt.normalize()
+    data["days_overdue"] = (today - due_dates).dt.days.clip(lower=0).astype(int)
+
+    # Invoice status.
+    data["invoice_status"] = "Open"
+    data.loc[data["outstanding_amount"].eq(0), "invoice_status"] = "Paid"
+    data.loc[
+        data["outstanding_amount"].gt(0) & due_dates.ge(today),
+        "invoice_status",
+    ] = "Not Due"
+    data.loc[
+        data["outstanding_amount"].gt(0) & due_dates.lt(today),
+        "invoice_status",
+    ] = "Overdue"
+
+    # Aging bucket. Invoices due today are Current (0 days overdue).
+    data["aging_bucket"] = pd.cut(
+        data["days_overdue"],
+        bins=[-1, 0, 30, 60, 90, float("inf")],
+        labels=["Current", "1-30 days", "31-60 days", "61-90 days", "90+ days"],
+    )
+
+    # Basic, explainable prioritization rules.
+    def get_priority(row):
+        if row["outstanding_amount"] == 0:
+            return "Closed"
+
+        dispute = str(row["dispute_status"]).strip().lower()
+        if dispute not in {"", "none", "no", "false", "nan", "not disputed"}:
+            return "Review"
+
+        if row["days_overdue"] >= 60:
+            return "High"
+        if row["days_overdue"] >= 30:
+            return "Medium"
+        if row["days_overdue"] > 0:
+            return "Low"
+        return "Not Due"
+
+    data["priority"] = data.apply(get_priority, axis=1)
+
+    return data
+
+
+# ------------------------------------------------------------
+# File loading
+# ------------------------------------------------------------
+uploaded_file = st.file_uploader(
+    "Upload invoice data",
+    type=["csv", "xlsx"],
+    help="Required columns: " + ", ".join(REQUIRED_COLUMNS),
+)
+
+raw_data = None
+
+if uploaded_file is not None:
+    try:
+        if uploaded_file.name.lower().endswith(".csv"):
+            raw_data = pd.read_csv(uploaded_file)
+        else:
+            raw_data = pd.read_excel(uploaded_file)
+    except Exception as error:
+        st.error(f"Unable to read the uploaded file: {error}")
+        st.stop()
+else:
+    st.info("Upload a CSV or Excel invoice file, or load the included sample data.")
+    if st.button("Load sample data", type="primary"):
+        if not SAMPLE_FILE.exists():
+            st.error(
+                "sample_invoices.csv was not found next to app.py. "
+                "Upload your own CSV/XLSX file or place the sample file beside app.py."
+            )
+            st.stop()
+        try:
+            raw_data = pd.read_csv(SAMPLE_FILE)
+        except Exception as error:
+            st.error(f"Unable to load sample data: {error}")
+            st.stop()
+    else:
+        st.stop()
+
+
+# ------------------------------------------------------------
+# Validate and prepare data
+# ------------------------------------------------------------
+try:
+    invoices = process_invoices(raw_data)
+except Exception as error:
+    st.error(f"Invoice validation failed: {error}")
+    st.caption("Check that the CSV/XLSX contains the required column names and valid rows.")
+    st.stop()
+
+open_invoices = invoices.loc[invoices["outstanding_amount"] > 0].copy()
+overdue_invoices = open_invoices.loc[open_invoices["days_overdue"] > 0].copy()
+high_priority = open_invoices.loc[open_invoices["priority"] == "High"].copy()
+
+
+# ------------------------------------------------------------
+# KPI metrics
+# ------------------------------------------------------------
+col1, col2, col3, col4 = st.columns(4)
+
+col1.metric(
+    "Total Outstanding",
+    f"₹{open_invoices['outstanding_amount'].sum():,.0f}",
+)
+col2.metric(
+    "Overdue Amount",
+    f"₹{overdue_invoices['outstanding_amount'].sum():,.0f}",
+)
+col3.metric("Overdue Invoices", f"{len(overdue_invoices):,}")
+col4.metric("High Priority", f"{len(high_priority):,}")
+
+st.divider()
+
+
+# ------------------------------------------------------------
+# Invoice explorer
+# ------------------------------------------------------------
+st.subheader("Invoice Explorer")
+search = st.text_input("Search invoice or customer")
+
+filtered = invoices.copy()
+if search.strip():
+    query = search.strip()
+    mask = (
+        filtered["invoice_number"].str.contains(query, case=False, na=False, regex=False)
+        | filtered["customer_name"].str.contains(query, case=False, na=False, regex=False)
+    )
+    filtered = filtered.loc[mask]
+
+display_columns = [
+    "invoice_number",
+    "customer_name",
+    "invoice_amount",
+    "outstanding_amount",
+    "days_overdue",
+    "aging_bucket",
+    "dispute_status",
+    "invoice_status",
+    "priority",
+]
+
+st.dataframe(
+    filtered[display_columns],
+    use_container_width=True,
+    hide_index=True,
+)
+
+st.divider()
+
+
+# ------------------------------------------------------------
+# Charts
+# ------------------------------------------------------------
+left, right = st.columns(2)
+
+with left:
+    st.subheader("Outstanding by Aging Bucket")
+
+    if overdue_invoices.empty:
+        st.info("No overdue invoices were found.")
+    else:
+        aging_summary = (
+            overdue_invoices.groupby("aging_bucket", observed=False)["outstanding_amount"]
+            .sum()
+            .reset_index()
+        )
+        aging_summary = aging_summary.loc[
+            aging_summary["outstanding_amount"] > 0
+        ].copy()
+        aging_summary["aging_bucket"] = aging_summary["aging_bucket"].astype(str)
+
+        if aging_summary.empty:
+            st.info("No overdue balance is available to chart.")
+        else:
+            figure = px.bar(
+                aging_summary,
+                x="aging_bucket",
+                y="outstanding_amount",
+                title="Overdue Balance by Aging",
+                labels={
+                    "aging_bucket": "Aging Bucket",
+                    "outstanding_amount": "Outstanding Amount (₹)",
+                },
+            )
+            figure.update_layout(xaxis_title="Aging Bucket", yaxis_title="Outstanding Amount (₹)")
+            st.plotly_chart(figure, use_container_width=True)
+
+with right:
+    st.subheader("Collection Priorities")
+
+    if open_invoices.empty:
+        st.info("No outstanding invoices were found.")
+    else:
+        priority_summary = (
+            open_invoices.groupby("priority")
+            .size()
+            .reset_index(name="invoice_count")
+        )
+        figure = px.pie(
+            priority_summary,
+            names="priority",
+            values="invoice_count",
+            title="Open Invoices by Priority",
+        )
+        st.plotly_chart(figure, use_container_width=True)
+
+
+# ------------------------------------------------------------
+# High-priority queue
+# ------------------------------------------------------------
+st.divider()
+st.subheader("High-Priority Collection Queue")
+
+if high_priority.empty:
+    st.info("There are no invoices currently marked High priority.")
+else:
+    st.dataframe(
+        high_priority[
+            [
+                "invoice_number",
+                "customer_name",
+                "customer_email",
+                "outstanding_amount",
+                "days_overdue",
+                "dispute_status",
+            ]
+        ],
+        use_container_width=True,
+        hide_index=True,
+    )
+
+# ------------------------------------------------------------
+# AI payment reminder generator
+# ------------------------------------------------------------
+from llm_service import (
+    LLMServiceError,
+    generate_payment_reminder,
+)
+
+st.divider()
+st.header("AI Payment Reminder Generator")
+st.caption(
+    "Generate an editable reminder draft from an overdue invoice. "
+    "This prototype does not send email."
+)
+
+# Surface disputed invoices separately; never draft a collection chase for them.
+disputed_overdue = invoices.loc[
+    (invoices["outstanding_amount"] > 0)
+    & (invoices["days_overdue"] > 0)
+    & (invoices["priority"] == "Review")
+].copy()
+if not disputed_overdue.empty:
+    st.warning(
+        f"{len(disputed_overdue)} overdue invoice(s) are flagged for review. "
+        "Reminder generation is blocked for these invoices until the dispute/status is resolved."
+    )
+    st.dataframe(
+        disputed_overdue[[
+            "invoice_number", "customer_name", "outstanding_amount",
+            "days_overdue", "dispute_status", "priority"
+        ]],
+        use_container_width=True,
+        hide_index=True,
+    )
+
+# Only offer overdue invoices with a balance and no unresolved dispute.
+eligible_invoices = invoices.loc[
+    (invoices["outstanding_amount"] > 0)
+    & (invoices["days_overdue"] > 0)
+    & (invoices["priority"] != "Review")
+].copy()
+
+if eligible_invoices.empty:
+    st.info(
+        "No eligible overdue invoices are available. "
+        "Check your invoice data or select another dataset."
+    )
+else:
+    eligible_invoices["invoice_label"] = eligible_invoices.apply(
+        lambda row: (
+            f"{row['invoice_number']} | {row['customer_name']} | "
+            f"₹{row['outstanding_amount']:,.2f} | "
+            f"{int(row['days_overdue'])} days overdue"
+        ),
+        axis=1,
+    )
+
+    selected_label = st.selectbox(
+        "Select an overdue invoice",
+        options=eligible_invoices["invoice_label"].tolist(),
+        key="reminder_selected_invoice",
+    )
+    selected_invoice = eligible_invoices.loc[
+        eligible_invoices["invoice_label"] == selected_label
+    ].iloc[0]
+    selected_invoice_number = str(selected_invoice["invoice_number"])
+
+    tone = st.selectbox(
+        "Reminder tone",
+        options=["Professional", "Friendly", "Firm"],
+        index=0,
+        key="reminder_tone",
+    )
+
+    st.write("### Selected invoice details")
+    detail_col1, detail_col2, detail_col3 = st.columns(3)
+    detail_col1.metric(
+        "Outstanding amount",
+        f"₹{selected_invoice['outstanding_amount']:,.2f}",
+    )
+    detail_col2.metric("Days overdue", int(selected_invoice["days_overdue"]))
+    detail_col3.write(f"**Customer:** {selected_invoice['customer_name']}")
+
+    st.write(f"**Invoice number:** {selected_invoice_number}")
+    st.write(
+        f"**Customer email:** {selected_invoice['customer_email'] or 'Not provided'}"
+    )
+    st.write(
+        f"**Due date:** {selected_invoice['due_date'].strftime('%d %b %Y')}"
+    )
+
+    if st.button("Generate AI Payment Reminder", type="primary"):
+        with st.spinner("Generating payment reminder..."):
+            try:
+                draft = generate_payment_reminder(
+                    invoice_number=selected_invoice_number,
+                    customer_name=str(selected_invoice["customer_name"]),
+                    outstanding_amount=float(selected_invoice["outstanding_amount"]),
+                    due_date=selected_invoice["due_date"].strftime("%d %b %Y"),
+                    days_overdue=int(selected_invoice["days_overdue"]),
+                    reminder_tone=tone,
+                )
+
+                # Store the structured response and initialize editable fields.
+                st.session_state["generated_email_draft"] = draft
+                st.session_state["generated_email_invoice"] = selected_invoice_number
+                st.session_state["generated_email_tone"] = tone
+                st.session_state["edited_email_subject"] = draft["subject"]
+                st.session_state["edited_email_body"] = draft["body"]
+                st.session_state["email_draft_saved"] = False
+                record_activity(
+                    invoice_number=selected_invoice_number,
+                    customer_name=str(selected_invoice["customer_name"]),
+                    activity_type="AI reminder generated",
+                    status="Draft - awaiting human review",
+                    subject=draft["subject"],
+                    body=draft["body"],
+                    tone=draft["tone"],
+                    recommended_action=draft["recommended_action"],
+                    notes="Generated by AI; not sent.",
+                )
+                st.rerun()
+
+            except LLMServiceError as error:
+                st.error(str(error))
+            except Exception as error:
+                st.error(
+                    "An unexpected error occurred while generating the draft: "
+                    f"{type(error).__name__}: {error}"
+                )
+
+    draft_invoice = st.session_state.get("generated_email_invoice")
+    draft = st.session_state.get("generated_email_draft")
+
+    # Do not show a draft generated for a different invoice.
+    if draft_invoice == selected_invoice_number and isinstance(draft, dict):
+        st.divider()
+        st.subheader("Review and edit the email draft")
+
+        st.info(
+            f"Generated in {draft.get('tone', tone)} tone. "
+            "Please verify all facts before using it."
+        )
+
+        st.text_input(
+            "Email subject",
+            key="edited_email_subject",
+            max_chars=200,
+        )
+        st.text_area(
+            "Email body",
+            key="edited_email_body",
+            height=280,
+        )
+
+        st.write("### Recommended next action")
+        st.write(draft.get("recommended_action", "No recommendation returned."))
+
+        if draft.get("requires_human_review") is True:
+            st.warning("Human review is required before this draft can be used.")
+        else:
+            st.error(
+                "The response did not require human review. Do not use this draft."
+            )
+
+        current_subject = st.session_state.get("edited_email_subject", "")
+        current_body = st.session_state.get("edited_email_body", "")
+        combined_draft = f"Subject: {current_subject}\n\n{current_body}"
+
+        follow_up_date = st.date_input(
+            "Planned follow-up date (optional)",
+            value=None,
+            key=f"follow_up_{selected_invoice_number}",
+        )
+
+        save_col, review_col, download_col = st.columns(3)
+        with save_col:
+            if st.button("Save draft to activity history"):
+                follow_up_text = follow_up_date.isoformat() if follow_up_date else ""
+                record_activity(
+                    invoice_number=selected_invoice_number,
+                    customer_name=str(selected_invoice["customer_name"]),
+                    activity_type="Draft saved",
+                    status="Draft - awaiting human review",
+                    subject=current_subject,
+                    body=current_body,
+                    tone=draft.get("tone", tone),
+                    recommended_action=draft.get("recommended_action", ""),
+                    follow_up_date=follow_up_text,
+                    notes="Saved locally; not sent.",
+                )
+                st.session_state["email_draft_saved"] = True
+                st.success("Draft saved to the local activity database.")
+
+        with review_col:
+            if st.button("Mark as reviewed / approved"):
+                follow_up_text = follow_up_date.isoformat() if follow_up_date else ""
+                record_activity(
+                    invoice_number=selected_invoice_number,
+                    customer_name=str(selected_invoice["customer_name"]),
+                    activity_type="Human review recorded",
+                    status="Reviewed - not sent",
+                    subject=current_subject,
+                    body=current_body,
+                    tone=draft.get("tone", tone),
+                    recommended_action=draft.get("recommended_action", ""),
+                    follow_up_date=follow_up_text,
+                    notes="Human review recorded in prototype. No email was sent.",
+                )
+                st.success("Review recorded. This action does not send the email.")
+
+        with download_col:
+            st.download_button(
+                label="Download edited email draft",
+                data=combined_draft,
+                file_name=f"payment_reminder_{selected_invoice_number}.txt",
+                mime="text/plain",
+            )
+
+        if st.session_state.get("email_draft_saved"):
+            st.caption("A draft-save event was recorded in the local SQLite database.")
+
+        st.warning(
+            "This application does not send email. Review the customer, invoice "
+            "number, balance, due date, and wording before using the draft."
+        )
+
+# ------------------------------------------------------------
+# Persistent collection activity history
+# ------------------------------------------------------------
+st.divider()
+st.header("Collection Activity History")
+st.caption(
+    "The latest 500 events are stored locally in collection_activity.db. "
+    "This is a single-machine MVP log, not a multi-user audit system."
+)
+activity = load_activity()
+if activity.empty:
+    st.info("No collection activities recorded yet. Generate or save a reminder to begin.")
+else:
+    activity_display = activity.copy()
+    st.dataframe(activity_display, use_container_width=True, hide_index=True)
+    st.download_button(
+        "Export activity history as CSV",
+        data=activity.to_csv(index=False).encode("utf-8-sig"),
+        file_name="collection_activity_history.csv",
+        mime="text/csv",
+    )
+
+st.success("Invoice analysis completed successfully.")
+
+st.caption(
+    "Prototype only: invoice analysis and AI email drafting are enabled. " 
+    "Email sending and accounting-system integration are not enabled."
+)

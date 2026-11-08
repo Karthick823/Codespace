@@ -1,0 +1,101 @@
+import os
+
+from google import genai
+
+MODEL_NAME = "gemma-4-26b-a4b-it"
+
+class LLMServiceError(Exception):
+    """Raised when the LLM service cannot generate a valid response."""
+    
+def generate_payment_reminder(
+    invoice_number: str,
+    customer_name: str,
+    outstanding_amount: float,
+    due_date: str,
+    days_overdue: int,
+    reminder_tone:str = "Professional"
+) -> str:
+    """ Generate an editable payment reminder using the Gemini API. This function generates a draft only. It never sends an email. """
+    
+    api_key = os.getenv("GEMINI_API_KEY")
+    
+    if not api_key:
+        raise LLMServiceError(
+            "GEMINI_API_KEY is missing. Configure your API key " "in the terminal before starting the application."
+        )
+        
+    if reminder_tone not in{
+        "Professional",
+        "Friendly",
+        "Firm",
+        }:
+        raise LLMServiceError("Please select a supportive remainder tone.")
+        
+    if not invoice_number or not customer_name or not due_date:
+        raise LLMServiceError(
+            "The selected invoice is missing required information."
+        )
+        
+    if outstanding_amount <=0:
+        raise LLMServiceError(
+            "The invoice has no outstanding balance."
+        )
+    if days_overdue <=0:
+        raise LLMServiceError(
+            "This invoice is not overdue. " 
+            "Select an overdue invoice for this reminder."
+        )
+    
+    client = genai.Client(api_key=api_key)
+    
+    prompt = f""" 
+    
+    You are an assistant for an accounts receivable collections team.
+    Generate a concise, professional payment reminder email draft.
+    
+    Use only the verified invoice facts supplied below.
+    
+    Invoice number: {invoice_number} 
+    Customer name: {customer_name}
+    Outstanding amount: INR {outstanding_amount:,.2f}
+    Due date: {due_date}
+    Days overdue: {days_overdue}
+    Requested tone: {reminder_tone}
+    
+    Rules: 1. Do not invent facts, dates, previous conversations, promises, payment commitments, penalties, or contractual terms.
+    2. Do not claim that an email or reminder was sent previously.
+    3. Do not invent a payment deadline.
+    4. Do not threaten legal action or imply consequences not provided.
+    5. Ask the customer to confirm the expected payment date.
+    6. Use a respectful and business-appropriate tone.
+    7. Include a clear subject line and email body.
+    8. Do not include markdown code fences.
+    9. Do not send the email. Generate a draft for human review.
+    Return the response in exactly this format:
+    
+    SUBJECT: [email subject]
+    
+    BODY:
+    [email body]
+    """
+    
+    try:
+        response = client.models.generate_content(
+            model=MODEL_NAME,
+            contents=prompt,
+        )
+        
+        draft = (response.text or "").strip()
+        
+        if not draft:
+            raise LLMServiceError(
+                "The model retured an empty response. Please try again."
+            )
+            
+        return draft
+    
+    except Exception() as error:
+        raise LLMServiceError(
+            "The AI provider could not be generate the remainder. "
+            f" Technical details: {type(error).__name__}: {error}"
+        ) from None

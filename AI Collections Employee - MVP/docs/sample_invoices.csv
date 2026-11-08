@@ -1,0 +1,6 @@
+invoice_number,customer_name,customer_email,invoice_date,due_date,invoice_amount,outstanding_amount,dispute_status
+INV-1001,ABC Manufacturing,abc@example.com,7/1/2026,8/1/2026,150000,150000,None
+INV-1002,XYZ Enterprises,xyz@example.com,8/10/2026,9/10/2026,210000,210000,None
+INV-1003,Delta Industries,delta@example.com,7/15/2026,8/15/2026,95000,95000,Disputed
+INV-1004,Omega Technologies,omega@example.com,9/1/2026,10/20/2026,60000,60000,None
+INV-1005,Prime Components,prime@example.com,9/5/2026,10/5/2026,80000,30000,None

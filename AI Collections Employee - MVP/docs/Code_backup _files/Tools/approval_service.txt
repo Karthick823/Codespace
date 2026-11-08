@@ -1,0 +1,66 @@
+import sqlite3
+from datetime import datetime
+from pathlib import Path
+
+DB_PATH = Path(__file__).resolve().parent / "collection_workflow.db"
+STATUSES = ("Pending", "Approved", "Rejected")
+
+def connect():
+    db = sqlite3.connect(DB_PATH, timeout=10)
+    db.row_factory = sqlite3.Row
+    return db
+
+def initialize():
+    with connect() as db:
+        db.execute("""CREATE TABLE IF NOT EXISTS approval_requests (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            invoice_number TEXT NOT NULL,
+            proposed_action TEXT NOT NULL,
+            rationale TEXT NOT NULL,
+            requested_by TEXT NOT NULL,
+            status TEXT NOT NULL DEFAULT 'Pending',
+            reviewer TEXT,
+            reviewer_comments TEXT,
+            created_at TEXT NOT NULL,
+            decided_at TEXT,
+            execution_status TEXT NOT NULL DEFAULT 'Not executed'
+        )""")
+
+def create_request(invoice_number, proposed_action, rationale, requested_by):
+    vals = [str(v).strip() for v in (invoice_number, proposed_action, rationale, requested_by)]
+    if not all(vals):
+        raise ValueError("Invoice, action, rationale, and requester are required.")
+    initialize()
+    with connect() as db:
+        cur = db.execute("""INSERT INTO approval_requests
+            (invoice_number, proposed_action, rationale, requested_by, created_at)
+            VALUES (?, ?, ?, ?, ?)""", (*vals, datetime.now().isoformat(timespec="seconds")))
+        return cur.lastrowid
+
+def list_requests(status="All"):
+    initialize()
+    query, args = "SELECT * FROM approval_requests", ()
+    if status != "All":
+        if status not in STATUSES:
+            raise ValueError("Unsupported approval status.")
+        query, args = query + " WHERE status = ?", (status,)
+    query += " ORDER BY created_at DESC, id DESC"
+    with connect() as db:
+        return [dict(r) for r in db.execute(query, args).fetchall()]
+
+def decide_request(request_id, decision, reviewer, comments=""):
+    if decision not in ("Approved", "Rejected"):
+        raise ValueError("Decision must be Approved or Rejected.")
+    reviewer = str(reviewer).strip()
+    if not reviewer:
+        raise ValueError("Reviewer is required.")
+    initialize()
+    with connect() as db:
+        row = db.execute("SELECT status FROM approval_requests WHERE id = ?", (int(request_id),)).fetchone()
+        if row is None:
+            raise ValueError("Approval request not found.")
+        if row["status"] != "Pending":
+            raise ValueError("Only pending requests can be decided.")
+        db.execute("""UPDATE approval_requests SET status=?, reviewer=?,
+            reviewer_comments=?, decided_at=? WHERE id=?""",
+            (decision, reviewer, str(comments).strip(), datetime.now().isoformat(timespec="seconds"), int(request_id)))

@@ -1,0 +1,38 @@
+import os
+
+from google import genai
+
+
+def main():
+    api_key = os.getenv("GEMINI_API_KEY")
+
+    if not api_key:
+        print("ERROR: GEMINI_API_KEY is not configured.")
+        return
+
+    try:
+        client = genai.Client(api_key=api_key)
+
+        response = client.models.generate_content(
+            model="gemma-4-26b-a4b-it",
+            temperature=1.2,
+            thinking="Minimal",
+            contents=(
+                "Write a professional payment reminder email "
+                "for an invoice that is 15 days overdue. "
+                "Do not invent invoice numbers or payment dates."
+            ),
+            
+        )
+
+        print("Gemini API connection successful.")
+        print()
+        print(response.text)
+
+    except Exception() as error:
+        print("Gemini API request failed.")
+        print("Error:", error)
+
+
+if __name__ == "__main__":
+    main()

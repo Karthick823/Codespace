@@ -1,0 +1,351 @@
+from datetime import date
+from pathlib import Path
+
+import pandas as pd
+import plotly.express as px
+import streamlit as st
+
+
+# ------------------------------------------------------------
+# Page configuration
+# ------------------------------------------------------------
+st.set_page_config(
+    page_title="AI Collections Employee",
+    page_icon="📊",
+    layout="wide",
+)
+
+st.title("AI Collections Employee")
+st.caption("Accounts Receivable Intelligence Dashboard")
+
+
+# ------------------------------------------------------------
+# Configuration
+# ------------------------------------------------------------
+REQUIRED_COLUMNS = [
+    "invoice_number",
+    "customer_name",
+    "customer_email",
+    "invoice_date",
+    "due_date",
+    "invoice_amount",
+    "outstanding_amount",
+    "dispute_status",
+]
+
+SAMPLE_FILE = Path(__file__).resolve().parent / "sample_invoices.csv"
+
+
+# ------------------------------------------------------------
+# Data processing
+# ------------------------------------------------------------
+def process_invoices(data: pd.DataFrame) -> pd.DataFrame:
+    """Validate invoice data and calculate aging and priority fields."""
+    if data is None or data.empty:
+        raise ValueError("The invoice file is empty. Please upload data rows.")
+
+    data = data.copy()
+
+    # Normalize column names, including accidental surrounding spaces.
+    data.columns = [str(column).strip().lower() for column in data.columns]
+
+    missing_columns = [
+        column for column in REQUIRED_COLUMNS if column not in data.columns
+    ]
+    if missing_columns:
+        raise ValueError(
+            "Missing required columns: " + ", ".join(missing_columns)
+        )
+
+    # Normalize text fields.
+    for column in ["invoice_number", "customer_name", "customer_email", "dispute_status"]:
+        data[column] = data[column].fillna("").astype(str).str.strip()
+
+    # Normalize dates and amounts.
+    for column in ["invoice_date", "due_date"]:
+        data[column] = pd.to_datetime(data[column], errors="coerce")
+
+    for column in ["invoice_amount", "outstanding_amount"]:
+        # Accept values such as "₹1,500" as well as plain numbers.
+        cleaned = (
+            data[column]
+            .astype(str)
+            .str.replace(",", "", regex=False)
+            .str.replace("₹", "", regex=False)
+            .str.strip()
+        )
+        data[column] = pd.to_numeric(cleaned, errors="coerce")
+
+    # Required-field validation.
+    invalid = (
+        data["invoice_number"].eq("")
+        | data["customer_name"].eq("")
+        | data["due_date"].isna()
+        | data["invoice_amount"].isna()
+        | data["outstanding_amount"].isna()
+        | data["invoice_amount"].lt(0)
+        | data["outstanding_amount"].lt(0)
+        | data["outstanding_amount"].gt(data["invoice_amount"])
+    )
+
+    if invalid.any():
+        bad_rows = (data.index[invalid] + 2).tolist()[:10]
+        row_text = ", ".join(map(str, bad_rows))
+        raise ValueError(
+            f"{int(invalid.sum())} row(s) have missing or invalid required values. "
+            f"Example CSV row number(s): {row_text}."
+        )
+
+    # Invoice numbers should be unique within this uploaded file.
+    duplicates = data["invoice_number"].duplicated(keep=False)
+    if duplicates.any():
+        duplicate_ids = (
+            data.loc[duplicates, "invoice_number"].drop_duplicates().tolist()[:10]
+        )
+        raise ValueError(
+            "Duplicate invoice number(s) detected: "
+            + ", ".join(duplicate_ids)
+            + ". Please resolve duplicates before analysis."
+        )
+
+    # Use today's local system date to calculate overdue days.
+    today = pd.Timestamp(date.today())
+    due_dates = data["due_date"].dt.normalize()
+    data["days_overdue"] = (today - due_dates).dt.days.clip(lower=0).astype(int)
+
+    # Invoice status.
+    data["invoice_status"] = "Open"
+    data.loc[data["outstanding_amount"].eq(0), "invoice_status"] = "Paid"
+    data.loc[
+        data["outstanding_amount"].gt(0) & due_dates.ge(today),
+        "invoice_status",
+    ] = "Not Due"
+    data.loc[
+        data["outstanding_amount"].gt(0) & due_dates.lt(today),
+        "invoice_status",
+    ] = "Overdue"
+
+    # Aging bucket. Invoices due today are Current (0 days overdue).
+    data["aging_bucket"] = pd.cut(
+        data["days_overdue"],
+        bins=[-1, 0, 30, 60, 90, float("inf")],
+        labels=["Current", "1-30 days", "31-60 days", "61-90 days", "90+ days"],
+    )
+
+    # Basic, explainable prioritization rules.
+    def get_priority(row):
+        if row["outstanding_amount"] == 0:
+            return "Closed"
+
+        dispute = str(row["dispute_status"]).strip().lower()
+        if dispute not in {"", "none", "no", "false", "nan", "not disputed"}:
+            return "Review"
+
+        if row["days_overdue"] >= 60:
+            return "High"
+        if row["days_overdue"] >= 30:
+            return "Medium"
+        if row["days_overdue"] > 0:
+            return "Low"
+        return "Not Due"
+
+    data["priority"] = data.apply(get_priority, axis=1)
+
+    return data
+
+
+# ------------------------------------------------------------
+# File loading
+# ------------------------------------------------------------
+uploaded_file = st.file_uploader(
+    "Upload invoice data",
+    type=["csv", "xlsx"],
+    help="Required columns: " + ", ".join(REQUIRED_COLUMNS),
+)
+
+raw_data = None
+
+if uploaded_file is not None:
+    try:
+        if uploaded_file.name.lower().endswith(".csv"):
+            raw_data = pd.read_csv(uploaded_file)
+        else:
+            raw_data = pd.read_excel(uploaded_file)
+    except Exception as error:
+        st.error(f"Unable to read the uploaded file: {error}")
+        st.stop()
+else:
+    st.info("Upload a CSV or Excel invoice file, or load the included sample data.")
+    if st.button("Load sample data", type="primary"):
+        if not SAMPLE_FILE.exists():
+            st.error(
+                "sample_invoices.csv was not found next to app.py. "
+                "Upload your own CSV/XLSX file or place the sample file beside app.py."
+            )
+            st.stop()
+        try:
+            raw_data = pd.read_csv(SAMPLE_FILE)
+        except Exception as error:
+            st.error(f"Unable to load sample data: {error}")
+            st.stop()
+    else:
+        st.stop()
+
+
+# ------------------------------------------------------------
+# Validate and prepare data
+# ------------------------------------------------------------
+try:
+    invoices = process_invoices(raw_data)
+except Exception as error:
+    st.error(f"Invoice validation failed: {error}")
+    st.caption("Check that the CSV/XLSX contains the required column names and valid rows.")
+    st.stop()
+
+open_invoices = invoices.loc[invoices["outstanding_amount"] > 0].copy()
+overdue_invoices = open_invoices.loc[open_invoices["days_overdue"] > 0].copy()
+high_priority = open_invoices.loc[open_invoices["priority"] == "High"].copy()
+
+
+# ------------------------------------------------------------
+# KPI metrics
+# ------------------------------------------------------------
+col1, col2, col3, col4 = st.columns(4)
+
+col1.metric(
+    "Total Outstanding",
+    f"₹{open_invoices['outstanding_amount'].sum():,.0f}",
+)
+col2.metric(
+    "Overdue Amount",
+    f"₹{overdue_invoices['outstanding_amount'].sum():,.0f}",
+)
+col3.metric("Overdue Invoices", f"{len(overdue_invoices):,}")
+col4.metric("High Priority", f"{len(high_priority):,}")
+
+st.divider()
+
+
+# ------------------------------------------------------------
+# Invoice explorer
+# ------------------------------------------------------------
+st.subheader("Invoice Explorer")
+search = st.text_input("Search invoice or customer")
+
+filtered = invoices.copy()
+if search.strip():
+    query = search.strip()
+    mask = (
+        filtered["invoice_number"].str.contains(query, case=False, na=False, regex=False)
+        | filtered["customer_name"].str.contains(query, case=False, na=False, regex=False)
+    )
+    filtered = filtered.loc[mask]
+
+display_columns = [
+    "invoice_number",
+    "customer_name",
+    "invoice_amount",
+    "outstanding_amount",
+    "days_overdue",
+    "aging_bucket",
+    "dispute_status",
+    "invoice_status",
+    "priority",
+]
+
+st.dataframe(
+    filtered[display_columns],
+    use_container_width=True,
+    hide_index=True,
+)
+
+st.divider()
+
+
+# ------------------------------------------------------------
+# Charts
+# ------------------------------------------------------------
+left, right = st.columns(2)
+
+with left:
+    st.subheader("Outstanding by Aging Bucket")
+
+    if overdue_invoices.empty:
+        st.info("No overdue invoices were found.")
+    else:
+        aging_summary = (
+            overdue_invoices.groupby("aging_bucket", observed=False)["outstanding_amount"]
+            .sum()
+            .reset_index()
+        )
+        aging_summary = aging_summary.loc[
+            aging_summary["outstanding_amount"] > 0
+        ].copy()
+        aging_summary["aging_bucket"] = aging_summary["aging_bucket"].astype(str)
+
+        if aging_summary.empty:
+            st.info("No overdue balance is available to chart.")
+        else:
+            figure = px.bar(
+                aging_summary,
+                x="aging_bucket",
+                y="outstanding_amount",
+                title="Overdue Balance by Aging",
+                labels={
+                    "aging_bucket": "Aging Bucket",
+                    "outstanding_amount": "Outstanding Amount (₹)",
+                },
+            )
+            figure.update_layout(xaxis_title="Aging Bucket", yaxis_title="Outstanding Amount (₹)")
+            st.plotly_chart(figure, use_container_width=True)
+
+with right:
+    st.subheader("Collection Priorities")
+
+    if open_invoices.empty:
+        st.info("No outstanding invoices were found.")
+    else:
+        priority_summary = (
+            open_invoices.groupby("priority")
+            .size()
+            .reset_index(name="invoice_count")
+        )
+        figure = px.pie(
+            priority_summary,
+            names="priority",
+            values="invoice_count",
+            title="Open Invoices by Priority",
+        )
+        st.plotly_chart(figure, use_container_width=True)
+
+
+# ------------------------------------------------------------
+# High-priority queue
+# ------------------------------------------------------------
+st.divider()
+st.subheader("High-Priority Collection Queue")
+
+if high_priority.empty:
+    st.info("There are no invoices currently marked High priority.")
+else:
+    st.dataframe(
+        high_priority[
+            [
+                "invoice_number",
+                "customer_name",
+                "customer_email",
+                "outstanding_amount",
+                "days_overdue",
+                "dispute_status",
+            ]
+        ],
+        use_container_width=True,
+        hide_index=True,
+    )
+
+st.success("Invoice analysis completed successfully.")
+
+st.caption(
+    "Prototype only: this version analyzes uploaded data and does not send emails "
+    "or connect to an accounting system."
+)

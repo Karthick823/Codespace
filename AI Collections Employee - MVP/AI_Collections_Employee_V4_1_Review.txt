@@ -1,0 +1,51 @@
+AI COLLECTIONS EMPLOYEE — V4.0 SOURCE REVIEW / V4.1 PRE-PRODUCTION READINESS
+Review date: 24 October 2026
+Scope: uploaded ai_collections_employee_mvp.zip; static inspection, Python compilation, existing unit tests.
+
+SUMMARY
+- app.py compiles after the V4.1 changes provided separately.
+- 63 core regression/security/workflow tests passed.
+- Full unittest discovery did not pass: test_structured_output failed to import because the environment does not have the Google Gen AI SDK (`google-genai`) installed (ImportError: cannot import name 'genai' from 'google'). This is an environment/dependency failure, not proof that the test itself passes.
+- Compilation passed for Python files.
+- This is not a production security certification. Do not expose to the public internet or process real customer data yet.
+
+APP.PY CHANGES MADE
+1. Updated the visible version label to V4.1 pre-production security hardening in progress.
+2. Added a 30-minute idle timeout for the local Streamlit session; malformed timestamps expire the session.
+3. Reset idle-session state at logout and initialize it at successful login.
+4. Reduced audit noise by logging app access once per authenticated session instead of every Streamlit rerun.
+5. Replaced stale/conflicting legacy security banners with explicit remaining pre-production gates.
+
+FINDINGS / REQUIRED FOLLOW-UP
+HIGH PRIORITY
+- Local username/password authentication is not enterprise SSO/MFA. Use an identity provider for a hosted SaaS deployment.
+- The app is a large legacy Streamlit entry point with older workflow paths and multiple generations of services. UI hiding is not sufficient; each write/send/approval path must be tested at the service boundary.
+- Tenant isolation is not demonstrated in the supplied files. Do not onboard multiple companies until tenant_id scoping and cross-tenant tests exist across every query and mutation.
+- Audit rows are in the same SQLite database and are not tamper-evident against a database/file administrator. Production needs protected centralized/tamper-evident audit storage.
+- Live email sending should remain disabled until recipient authorization, exact approved-version checks, delivery-unknown recovery, duplicate prevention, and real Graph permissions are validated in a controlled test tenant.
+
+MEDIUM PRIORITY
+- The archive has no requirements.txt/lock file. Reproducible dependency installation and vulnerability scanning are not currently possible from the supplied package alone.
+- `sample_invoices.csv` is referenced by app.py but was not present in the archive. Confirm it is intentionally user-supplied or add a synthetic sample file.
+- The archive includes a live-looking SQLite database and a backup. Do not share real customer data or production database files in source bundles; replace them with a synthetic/schema-only DB and add DB/backup files to .gitignore.
+- Existing tests emit ResourceWarning messages for unclosed SQLite connections. Fix connection lifecycle/context management in tests/services.
+- The `test_structured_output.py` test cannot import until the correct Google Gen AI dependency is installed in the environment. Add a pinned dependency manifest, then rerun the full suite.
+- Review whether every sensitive export/report is role-appropriate and whether exported invoice/customer data is minimized.
+- Confirm secrets are supplied only through environment/managed secret storage and never committed to source or logs.
+
+RECOMMENDED V4.1 ORDER
+1. Add a pinned requirements.txt and synthetic fixture dataset; remove real DB/backup files from distributable source.
+2. Run all tests in a clean virtual environment after installing pinned dependencies.
+3. Inventory every UI action and map it to the service-layer authorization check; add tests for every role/action pair.
+4. Add tenant_id to all tenant-owned entities and enforce it in every service query/mutation; test cross-tenant access denial.
+5. Keep external sending disabled by default and test Graph sending only in a dedicated sandbox tenant.
+6. Add secret management, HTTPS/reverse proxy, rate limiting, dependency scanning, backup restore test, log redaction, retention/deletion policy, and operational monitoring.
+7. Complete a security review and documented go/no-go checklist before pilot deployment.
+
+TEST RESULTS
+- `python -m compileall -q .`: PASS
+- Targeted suite (v3.2 regression, v3.5 secure workflow, v3.6 reliability, v3.7 email drafts, v3.8 controlled email, v3.9 customer response): 63 tests PASS
+- Full unittest discovery: 64 tests discovered; 63 passed and test_structured_output failed during import due to missing/incompatible Google Gen AI SDK in the review environment.
+
+LIMITATION
+Static review and tests do not establish that every runtime workflow is safe. The app must be exercised in a clean, isolated environment with synthetic data, and authorization/service behavior must be independently verified before production.

@@ -1,0 +1,1010 @@
+from datetime import date
+from pathlib import Path
+
+import pandas as pd
+import plotly.express as px
+import streamlit as st
+
+# ------------------------------------------------------------
+# Page configuration
+# ------------------------------------------------------------
+st.set_page_config(
+    page_title="AI Collections Employee",
+    page_icon=":shark:",
+    layout="wide",
+)
+
+st.title("AI Collections Employee")
+st.caption("Accounts Receivable Intelligence Dashboard")
+
+
+# ------------------------------------------------------------
+# Configuration
+# ------------------------------------------------------------
+REQUIRED_COLUMNS = [
+    "invoice_number",
+    "customer_name",
+    "customer_email",
+    "invoice_date",
+    "due_date",
+    "invoice_amount",
+    "outstanding_amount",
+    "dispute_status",
+]
+
+SAMPLE_FILE = Path(__file__).resolve().parent / "sample_invoices.csv"
+
+
+# ------------------------------------------------------------
+# Data processing
+# ------------------------------------------------------------
+def process_invoices(data: pd.DataFrame) -> pd.DataFrame:
+    """Validate invoice data and calculate aging and priority fields."""
+    if data is None or data.empty:
+        raise ValueError("The invoice file is empty. Please upload data rows.")
+
+    data = data.copy()
+
+    # Normalize column names, including accidental surrounding spaces.
+    data.columns = [str(column).strip().lower() for column in data.columns]
+
+    missing_columns = [
+        column for column in REQUIRED_COLUMNS if column not in data.columns
+    ]
+    if missing_columns:
+        raise ValueError(
+            "Missing required columns: " + ", ".join(missing_columns)
+        )
+
+    # Normalize text fields.
+    for column in ["invoice_number", "customer_name", "customer_email", "dispute_status"]:
+        data[column] = data[column].fillna("").astype(str).str.strip()
+
+    # Normalize dates and amounts.
+    for column in ["invoice_date", "due_date"]:
+        data[column] = pd.to_datetime(data[column], errors="coerce")
+
+    for column in ["invoice_amount", "outstanding_amount"]:
+        # Accept values such as "₹1,500" as well as plain numbers.
+        cleaned = (
+            data[column]
+            .astype(str)
+            .str.replace(",", "", regex=False)
+            .str.replace("₹", "", regex=False)
+            .str.strip()
+        )
+        data[column] = pd.to_numeric(cleaned, errors="coerce")
+
+    # Required-field validation.
+    invalid = (
+        data["invoice_number"].eq("")
+        | data["customer_name"].eq("")
+        | data["due_date"].isna()
+        | data["invoice_amount"].isna()
+        | data["outstanding_amount"].isna()
+        | data["invoice_amount"].lt(0)
+        | data["outstanding_amount"].lt(0)
+        | data["outstanding_amount"].gt(data["invoice_amount"])
+    )
+
+    if invalid.any():
+        bad_rows = (data.index[invalid] + 2).tolist()[:10]
+        row_text = ", ".join(map(str, bad_rows))
+        raise ValueError(
+            f"{int(invalid.sum())} row(s) have missing or invalid required values. "
+            f"Example CSV row number(s): {row_text}."
+        )
+
+    # Invoice numbers should be unique within this uploaded file.
+    duplicates = data["invoice_number"].duplicated(keep=False)
+    if duplicates.any():
+        duplicate_ids = (
+            data.loc[duplicates, "invoice_number"].drop_duplicates().tolist()[:10]
+        )
+        raise ValueError(
+            "Duplicate invoice number(s) detected: "
+            + ", ".join(duplicate_ids)
+            + ". Please resolve duplicates before analysis."
+        )
+
+    # Use today's local system date to calculate overdue days.
+    today = pd.Timestamp(date.today())
+    due_dates = data["due_date"].dt.normalize()
+    data["days_overdue"] = (today - due_dates).dt.days.clip(lower=0).astype(int)
+
+    # Invoice status.
+    data["invoice_status"] = "Open"
+    data.loc[data["outstanding_amount"].eq(0), "invoice_status"] = "Paid"
+    data.loc[
+        data["outstanding_amount"].gt(0) & due_dates.ge(today),
+        "invoice_status",
+    ] = "Not Due"
+    data.loc[
+        data["outstanding_amount"].gt(0) & due_dates.lt(today),
+        "invoice_status",
+    ] = "Overdue"
+
+    # Aging bucket. Invoices due today are Current (0 days overdue).
+    data["aging_bucket"] = pd.cut(
+        data["days_overdue"],
+        bins=[-1, 0, 30, 60, 90, float("inf")],
+        labels=["Current", "1-30 days", "31-60 days", "61-90 days", "90+ days"],
+    )
+
+    # Basic, explainable prioritization rules.
+    def get_priority(row):
+        if row["outstanding_amount"] == 0:
+            return "Closed"
+
+        dispute = str(row["dispute_status"]).strip().lower()
+        if dispute not in {"", "none", "no", "false", "nan", "not disputed"}:
+            return "Review"
+
+        if row["days_overdue"] >= 60:
+            return "High"
+        if row["days_overdue"] >= 30:
+            return "Medium"
+        if row["days_overdue"] > 0:
+            return "Low"
+        return "Not Due"
+
+    data["priority"] = data.apply(get_priority, axis=1)
+
+    return data
+
+
+# ------------------------------------------------------------
+# File loading
+# ------------------------------------------------------------
+uploaded_file = st.file_uploader(
+    "Upload invoice data",
+    type=["csv", "xlsx"],
+    help="Required columns: " + ", ".join(REQUIRED_COLUMNS),
+)
+
+raw_data = None
+
+if uploaded_file is not None:
+    try:
+        if uploaded_file.name.lower().endswith(".csv"):
+            raw_data = pd.read_csv(uploaded_file)
+        else:
+            raw_data = pd.read_excel(uploaded_file)
+    except Exception as error:  # noqa: BLE001
+        st.error(f"Unable to read the uploaded file: {error}")
+        st.stop()
+else:
+    st.info("Upload a CSV or Excel invoice file, or load the included sample data.")
+    if st.button("Load sample data", type="primary"):
+        if not SAMPLE_FILE.exists():
+            st.error(
+                "sample_invoices.csv was not found next to app.py. "
+                "Upload your own CSV/XLSX file or place the sample file beside app.py."
+            )
+            st.stop()
+        try:
+            raw_data = pd.read_csv(SAMPLE_FILE)
+        except Exception as error:  # noqa: BLE001
+            st.error(f"Unable to load sample data: {error}")
+            st.stop()
+    else:
+        st.stop()
+
+
+# ------------------------------------------------------------
+# Validate and prepare data
+# ------------------------------------------------------------
+try:
+    invoices = process_invoices(raw_data)
+except Exception as error:  # noqa: BLE001
+    st.error(f"Invoice validation failed: {error}")
+    st.caption("Check that the CSV/XLSX contains the required column names and valid rows.")
+    st.stop()
+
+open_invoices = invoices.loc[invoices["outstanding_amount"] > 0].copy()
+overdue_invoices = open_invoices.loc[open_invoices["days_overdue"] > 0].copy()
+high_priority = open_invoices.loc[open_invoices["priority"] == "High"].copy()
+
+
+# ------------------------------------------------------------
+# KPI metrics
+# ------------------------------------------------------------
+col1, col2, col3, col4 = st.columns(4)
+
+col1.metric(
+    "Total Outstanding",
+    f"₹{open_invoices['outstanding_amount'].sum():,.0f}",
+)
+col2.metric(
+    "Overdue Amount",
+    f"₹{overdue_invoices['outstanding_amount'].sum():,.0f}",
+)
+col3.metric("Overdue Invoices", f"{len(overdue_invoices):,}")
+col4.metric("High Priority", f"{len(high_priority):,}")
+
+st.divider()
+
+
+# ------------------------------------------------------------
+# Invoice explorer
+# ------------------------------------------------------------
+st.subheader("Invoice Explorer")
+search = st.text_input("Search invoice or customer")
+
+filtered = invoices.copy()
+if search.strip():
+    query = search.strip()
+    mask = (
+        filtered["invoice_number"].str.contains(query, case=False, na=False, regex=False)
+        | filtered["customer_name"].str.contains(query, case=False, na=False, regex=False)
+    )
+    filtered = filtered.loc[mask]
+
+display_columns = [
+    "invoice_number",
+    "customer_name",
+    "invoice_amount",
+    "outstanding_amount",
+    "days_overdue",
+    "aging_bucket",
+    "dispute_status",
+    "invoice_status",
+    "priority",
+]
+
+st.dataframe(
+    filtered[display_columns],
+    use_container_width=True,
+    hide_index=True,
+)
+
+st.divider()
+
+
+# ------------------------------------------------------------
+# Charts
+# ------------------------------------------------------------
+left, right = st.columns(2)
+
+with left:
+    st.subheader("Outstanding by Aging Bucket")
+
+    if overdue_invoices.empty:
+        st.info("No overdue invoices were found.")
+    else:
+        aging_summary = (
+            overdue_invoices.groupby("aging_bucket", observed=False)["outstanding_amount"]
+            .sum()
+            .reset_index()
+        )
+        aging_summary = aging_summary.loc[
+            aging_summary["outstanding_amount"] > 0
+        ].copy()
+        aging_summary["aging_bucket"] = aging_summary["aging_bucket"].astype(str)
+
+        if aging_summary.empty:
+            st.info("No overdue balance is available to chart.")
+        else:
+            figure = px.bar(
+                aging_summary,
+                x="aging_bucket",
+                y="outstanding_amount",
+                title="Overdue Balance by Aging",
+                labels={
+                    "aging_bucket": "Aging Bucket",
+                    "outstanding_amount": "Outstanding Amount (₹)",
+                },
+            )
+            figure.update_layout(xaxis_title="Aging Bucket", yaxis_title="Outstanding Amount (₹)")
+            st.plotly_chart(figure, use_container_width=True)
+
+with right:
+    st.subheader("Collection Priorities")
+
+    if open_invoices.empty:
+        st.info("No outstanding invoices were found.")
+    else:
+        priority_summary = (
+            open_invoices.groupby("priority")
+            .size()
+            .reset_index(name="invoice_count")
+        )
+        figure = px.pie(
+            priority_summary,
+            names="priority",
+            values="invoice_count",
+            title="Open Invoices by Priority",
+        )
+        st.plotly_chart(figure, use_container_width=True)
+
+
+# ------------------------------------------------------------
+# High-priority queue
+# ------------------------------------------------------------
+st.divider()
+st.subheader("High-Priority Collection Queue")
+
+if high_priority.empty:
+    st.info("There are no invoices currently marked High priority.")
+else:
+    st.dataframe(
+        high_priority[
+            [
+                "invoice_number",
+                "customer_name",
+                "customer_email",
+                "outstanding_amount",
+                "days_overdue",
+                "dispute_status",
+            ]
+        ],
+        use_container_width=True,
+        hide_index=True,
+    )
+
+# ------------------------------------------------------------
+# AI payment reminder generator
+# ------------------------------------------------------------
+from llm_service import (
+    LLMServiceError,
+    generate_payment_reminder,
+)
+
+st.divider()
+st.header("AI Payment Reminder Generator")
+st.caption(
+    "Generate an editable reminder draft from an overdue invoice. "
+    "This prototype does not send email."
+)
+
+# Only offer overdue invoices with a balance and no unresolved dispute.
+eligible_invoices = invoices.loc[
+    (invoices["outstanding_amount"] > 0)
+    & (invoices["days_overdue"] > 0)
+    & (invoices["priority"] != "Review")
+].copy()
+
+if eligible_invoices.empty:
+    st.info(
+        "No eligible overdue invoices are available. "
+        "Check your invoice data or select another dataset."
+    )
+else:
+    eligible_invoices["invoice_label"] = eligible_invoices.apply(
+        lambda row: (
+            f"{row['invoice_number']} | {row['customer_name']} | "
+            f"₹{row['outstanding_amount']:,.2f} | "
+            f"{int(row['days_overdue'])} days overdue"
+        ),
+        axis=1,
+    )
+
+    selected_label = st.selectbox(
+        "Select an overdue invoice",
+        options=eligible_invoices["invoice_label"].tolist(),
+        key="reminder_selected_invoice",
+    )
+    selected_invoice = eligible_invoices.loc[
+        eligible_invoices["invoice_label"] == selected_label
+    ].iloc[0]
+    selected_invoice_number = str(selected_invoice["invoice_number"])
+
+    tone = st.selectbox(
+        "Reminder tone",
+        options=["Professional", "Friendly", "Firm"],
+        index=0,
+        key="reminder_tone",
+    )
+
+    st.write("### Selected invoice details")
+    detail_col1, detail_col2, detail_col3 = st.columns(3)
+    detail_col1.metric(
+        "Outstanding amount",
+        f"₹{selected_invoice['outstanding_amount']:,.2f}",
+    )
+    detail_col2.metric("Days overdue", int(selected_invoice["days_overdue"]))
+    detail_col3.write(f"**Customer:** {selected_invoice['customer_name']}")
+
+    st.write(f"**Invoice number:** {selected_invoice_number}")
+    st.write(
+        f"**Customer email:** {selected_invoice['customer_email'] or 'Not provided'}"
+    )
+    st.write(
+        f"**Due date:** {selected_invoice['due_date'].strftime('%d %b %Y')}"
+    )
+
+    if st.button("Generate AI Payment Reminder", type="primary"):
+        with st.spinner("Generating payment reminder..."):
+            try:
+                draft = generate_payment_reminder(
+                    invoice_number=selected_invoice_number,
+                    customer_name=str(selected_invoice["customer_name"]),
+                    outstanding_amount=float(selected_invoice["outstanding_amount"]),
+                    due_date=selected_invoice["due_date"].strftime("%d %b %Y"),
+                    days_overdue=int(selected_invoice["days_overdue"]),
+                    reminder_tone=tone,
+                )
+
+                # Store the structured response and initialize editable fields.
+                st.session_state["generated_email_draft"] = draft
+                st.session_state["generated_email_invoice"] = selected_invoice_number
+                st.session_state["generated_email_tone"] = tone
+                st.session_state["edited_email_subject"] = draft["subject"]
+                st.session_state["edited_email_body"] = draft["body"]
+                st.session_state["email_draft_saved"] = False
+                st.rerun()
+
+            except LLMServiceError as error:
+                st.error(str(error))
+            except Exception as error:  # noqa: BLE001
+                st.error(
+                    "An unexpected error occurred while generating the draft: "
+                    f"{type(error).__name__}: {error}"
+                )
+
+    draft_invoice = st.session_state.get("generated_email_invoice")
+    draft = st.session_state.get("generated_email_draft")
+
+    # Do not show a draft generated for a different invoice.
+    if draft_invoice == selected_invoice_number and isinstance(draft, dict):
+        st.divider()
+        st.subheader("Review and edit the email draft")
+
+        st.info(
+            f"Generated in {draft.get('tone', tone)} tone. "
+            "Please verify all facts before using it."
+        )
+
+        st.text_input(
+            "Email subject",
+            key="edited_email_subject",
+            max_chars=200,
+        )
+        st.text_area(
+            "Email body",
+            key="edited_email_body",
+            height=280,
+        )
+
+        st.write("### Recommended next action")
+        st.write(draft.get("recommended_action", "No recommendation returned."))
+
+        if draft.get("requires_human_review") is True:
+            st.warning("Human review is required before this draft can be used.")
+        else:
+            st.error(
+                "The response did not require human review. Do not use this draft."
+            )
+
+        current_subject = st.session_state.get("edited_email_subject", "")
+        current_body = st.session_state.get("edited_email_body", "")
+        combined_draft = f"Subject: {current_subject}\n\n{current_body}"
+
+        save_col, download_col = st.columns(2)
+        with save_col:
+            if st.button("Save draft in this session"):
+                st.session_state["email_draft_saved"] = True
+                st.session_state["saved_email_draft"] = {
+                    "invoice_number": selected_invoice_number,
+                    "customer_name": str(selected_invoice["customer_name"]),
+                    "subject": current_subject,
+                    "body": current_body,
+                    "tone": draft.get("tone", tone),
+                    "recommended_action": draft.get("recommended_action", ""),
+                    "requires_human_review": True,
+                    "status": "Draft - awaiting human review",
+                }
+                st.success("Draft saved in the current Streamlit session.")
+
+        with download_col:
+            st.download_button(
+                label="Download edited email draft",
+                data=combined_draft,
+                file_name=f"payment_reminder_{selected_invoice_number}.txt",
+                mime="text/plain",
+            )
+
+        if st.session_state.get("email_draft_saved"):
+            st.caption(
+                "Status: Draft saved in this browser session; it has not been "
+                "persisted to a database."
+            )
+
+        st.warning(
+            "This application does not send email. Review the customer, invoice "
+            "number, balance, due date, and wording before using the draft."
+        )
+
+st.success("Invoice analysis completed successfully.")
+
+st.caption(
+    "Prototype only: invoice analysis and AI email drafting are enabled. " 
+    "Email sending and accounting-system integration are not enabled."
+)
+
+# ------------------------------------------------------------
+# Customer response intelligence
+# ------------------------------------------------------------
+from response_classification_service import (
+    ResponseClassificationError,
+    classify_customer_response,
+)
+
+st.divider()
+st.header("Customer Response Intelligence")
+st.caption(
+    "Classify a customer email or message and recommend the next collection action. "
+    "This feature does not send emails or update accounting systems."
+)
+
+customer_response_text = st.text_area(
+    "Paste the customer's response",
+    placeholder=(
+        "Example: We confirm that we will pay invoice INV-1001 on 30 October."
+    ),
+    height=160,
+    key="customer_response_text",
+    help="Paste only the customer message. Avoid including unnecessary personal or confidential information.",
+)
+
+if st.button("Classify customer response", type="primary", key="classify_customer_response_button"):
+    if not customer_response_text.strip():
+        st.warning("Please paste a customer response before classifying it.")
+    else:
+        with st.spinner("Analysing customer response..."):
+            try:
+                classification = classify_customer_response(customer_response_text)
+                st.session_state["latest_customer_response_classification"] = classification
+                st.session_state["latest_classified_customer_response"] = customer_response_text.strip()
+            except ResponseClassificationError as error:
+                st.error(str(error))
+            except Exception as error:  # noqa: BLE001
+                # Show a useful but bounded error message; never expose API keys.
+                st.error(
+                    "An unexpected error occurred during classification. "
+                    f"Error type: {type(error).__name__}. Details: {error}"
+                )
+
+classification = st.session_state.get("latest_customer_response_classification")
+classified_text = st.session_state.get("latest_classified_customer_response")
+if isinstance(classification, dict) and classified_text:
+    st.subheader("Classification result")
+    result_col1, result_col2 = st.columns(2)
+    result_col1.metric("Response category", classification["category"])
+    result_col2.metric("Sentiment", classification["sentiment"])
+    st.write("**Recommended next action**")
+    st.write(classification["recommended_action"])
+
+    if classification.get("requires_human_review") is True:
+        st.warning("Human review is required before acting on this recommendation.")
+    else:
+        st.error("Safety check failed: human review must be required. Do not act on this result.")
+
+    st.download_button(
+        "Download classification as JSON",
+        data=__import__("json").dumps(classification, indent=2, ensure_ascii=False),
+        file_name="customer_response_classification.json",
+        mime="application/json",
+        key="download_customer_response_classification",
+    )
+    with st.expander("View the message that was classified"):
+        st.text(classified_text)
+
+st.caption(
+    "AI output may be incorrect. Verify the original customer message and invoice records. "
+    "This prototype requires human review and does not autonomously contact customers."
+)
+
+
+# ------------------------------------------------------------
+# V2.5: Persistent collection follow-up manager and activity history
+# ------------------------------------------------------------
+from follow_up_service import (
+    TASK_STATUSES,
+    TASK_TYPES,
+    create_task,
+    initialize_database,
+    list_activity,
+    list_tasks,
+    update_task_status,
+)
+
+initialize_database()
+st.divider()
+st.header("Collection Follow-up Manager")
+st.caption(
+    "Create and track follow-up tasks in a local SQLite database. "
+    "Tasks require human review; this feature does not send email or update an ERP."
+)
+
+with st.expander("Create a follow-up task", expanded=False):
+    task_invoice_options = invoices["invoice_number"].astype(str).tolist()
+    selected_task_invoice = st.selectbox(
+        "Invoice for follow-up",
+        options=task_invoice_options,
+        key="follow_up_invoice_select",
+    )
+    selected_task_row = invoices.loc[
+        invoices["invoice_number"].astype(str) == selected_task_invoice
+    ].iloc[0]
+    st.write(
+        f"**Customer:** {selected_task_row['customer_name']}  \n"
+        f"**Outstanding:** ₹{float(selected_task_row['outstanding_amount']):,.2f}  \n"
+        f"**Priority:** {selected_task_row['priority']}  \n"
+        f"**Dispute status:** {selected_task_row['dispute_status'] or 'None recorded'}"
+    )
+
+    with st.form("create_follow_up_task_form"):
+        task_type = st.selectbox("Task type", options=list(TASK_TYPES))
+        task_description = st.text_area(
+            "Task description",
+            value="Review invoice and determine the appropriate next collection action.",
+            max_chars=1000,
+        )
+        task_due_date = st.date_input("Follow-up date", value=date.today())
+        task_status = st.selectbox("Initial status", options=["Open", "Awaiting approval"])
+        create_submitted = st.form_submit_button("Create follow-up task", type="primary")
+
+    if create_submitted:
+        try:
+            task_id = create_task(
+                invoice_number=selected_task_invoice,
+                customer_name=str(selected_task_row["customer_name"]),
+                task_type=task_type,
+                description=task_description,
+                due_date=task_due_date,
+                status=task_status,
+                requires_human_review=True,
+            )
+            st.success(f"Follow-up task #{task_id} created and saved to the local database.")
+            st.rerun()
+        except Exception as error:  # noqa: BLE001
+            st.error(f"Could not create task: {type(error).__name__}: {error}")
+
+st.subheader("Follow-up task queue")
+status_filter = st.selectbox(
+    "Filter tasks by status",
+    options=["All", *TASK_STATUSES],
+    key="follow_up_status_filter",
+)
+try:
+    tasks = list_tasks(status_filter)
+    if tasks:
+        tasks_df = pd.DataFrame(tasks)
+        tasks_df["requires_human_review"] = tasks_df["requires_human_review"].map(
+            {1: "Yes", 0: "No"}
+        )
+        st.dataframe(
+            tasks_df[
+                [
+                    "id", "invoice_number", "customer_name", "task_type",
+                    "description", "due_date", "status", "requires_human_review",
+                    "created_at", "updated_at",
+                ]
+            ],
+            use_container_width=True,
+            hide_index=True,
+        )
+        st.download_button(
+            "Download follow-up tasks as CSV",
+            data=tasks_df.to_csv(index=False).encode("utf-8"),
+            file_name="collection_follow_up_tasks.csv",
+            mime="text/csv",
+            key="download_follow_up_tasks_csv",
+        )
+
+        st.subheader("Update task status")
+        task_ids = [int(task["id"]) for task in tasks]
+        selected_task_id = st.selectbox(
+            "Select task ID",
+            options=task_ids,
+            key="follow_up_update_task_id",
+        )
+        new_task_status = st.selectbox(
+            "New status",
+            options=list(TASK_STATUSES),
+            key="follow_up_new_status",
+        )
+        status_notes = st.text_input(
+            "Activity note (optional)",
+            placeholder="For example: Reviewed evidence; awaiting manager approval.",
+            key="follow_up_status_notes",
+        )
+        if st.button("Save task status", key="save_follow_up_status"):
+            try:
+                update_task_status(selected_task_id, new_task_status, status_notes)
+                st.success(f"Task #{selected_task_id} updated.")
+                st.rerun()
+            except Exception as error:  # noqa: BLE001
+                st.error(f"Could not update task: {type(error).__name__}: {error}")
+    else:
+        st.info("No follow-up tasks match this filter. Create a task above to begin.")
+
+    st.subheader("Collection activity history")
+    activity = list_activity(limit=200)
+    if activity:
+        st.dataframe(
+            pd.DataFrame(activity),
+            use_container_width=True,
+            hide_index=True,
+        )
+        st.download_button(
+            "Download activity history as CSV",
+            data=pd.DataFrame(activity).to_csv(index=False).encode("utf-8"),
+            file_name="collection_activity_history.csv",
+            mime="text/csv",
+            key="download_collection_activity_csv",
+        )
+    else:
+        st.info("No activity has been recorded yet.")
+except Exception as error:  # noqa: BLE001
+    st.error(
+        "The follow-up manager could not load its local database. "
+        f"Error type: {type(error).__name__}: {error}"
+    )
+
+st.caption(
+    "V2.5 local persistence: tasks and activity are stored in collection_workflow.db "
+    "beside app.py. Back up this file. Do not store sensitive customer data unless "
+    "your storage and access controls are appropriate."
+)
+
+
+# ------------------------------------------------------------
+# V2.6: Explainable, dispute-aware collection decision preview
+# ------------------------------------------------------------
+from collection_rules import decide_collection_action
+
+st.divider()
+st.header("Collection Decision Assistant")
+st.caption(
+    "Explainable Python rules suggest a next step using invoice status and an optional "
+    "customer-response category. This is a recommendation preview only."
+)
+
+decision_invoice_options = invoices["invoice_number"].astype(str).tolist()
+decision_invoice_number = st.selectbox(
+    "Select invoice for decision review",
+    options=decision_invoice_options,
+    key="decision_assistant_invoice",
+)
+decision_row = invoices.loc[
+    invoices["invoice_number"].astype(str) == decision_invoice_number
+].iloc[0]
+
+decision_categories = [
+    "No response classified",
+    "Payment promised",
+    "Payment completed",
+    "Invoice dispute",
+    "Missing invoice",
+    "Request for supporting documents",
+    "Payment date requested",
+    "No clear response",
+]
+decision_category = st.selectbox(
+    "Customer response category (if known)",
+    options=decision_categories,
+    key="decision_assistant_response_category",
+)
+category_value = None if decision_category == "No response classified" else decision_category
+
+try:
+    decision = decide_collection_action(
+        invoice_number=decision_invoice_number,
+        outstanding_amount=float(decision_row["outstanding_amount"]),
+        days_overdue=int(decision_row["days_overdue"]),
+        dispute_status=decision_row["dispute_status"],
+        customer_response_category=category_value,
+    )
+    result_left, result_right = st.columns(2)
+    result_left.metric("Recommended workflow", decision.decision)
+    result_right.metric("Reminder permitted by rules", "Yes" if decision.reminder_allowed else "No")
+    st.write("**Recommended action**")
+    st.write(decision.recommended_action)
+    st.write("**Reason**")
+    st.write(decision.reason)
+    st.warning("Human review is required. This preview does not execute the recommendation.")
+    st.download_button(
+        "Download decision as JSON",
+        data=__import__("json").dumps(
+            {
+                "invoice_number": decision.invoice_number,
+                "decision": decision.decision,
+                "recommended_action": decision.recommended_action,
+                "reason": decision.reason,
+                "requires_human_review": decision.requires_human_review,
+                "reminder_allowed": decision.reminder_allowed,
+            },
+            indent=2,
+            ensure_ascii=False,
+        ),
+        file_name=f"collection_decision_{decision_invoice_number}.json",
+        mime="application/json",
+        key="download_collection_decision_json",
+    )
+except Exception as error:  # noqa: BLE001
+    st.error(f"Unable to evaluate collection rules: {type(error).__name__}: {error}")
+
+
+# ------------------------------------------------------------
+# V2.7: Human approval queue (records decisions; executes nothing)
+# ------------------------------------------------------------
+from approval_service import STATUSES, create_request, decide_request, list_requests
+from approval_service import initialize as initialize_approvals
+
+initialize_approvals()
+st.divider()
+st.header("Human Approval Queue")
+st.caption("Record review decisions for proposed collection actions. No email or accounting action is executed.")
+
+with st.expander("Submit an action for approval", expanded=False):
+    ap_invoice = st.selectbox("Invoice for approval", invoices["invoice_number"].astype(str).tolist(), key="ap_invoice")
+    ap_action = st.selectbox("Proposed action", [
+        "Prepare payment reminder", "Review invoice dispute", "Verify reported payment",
+        "Prepare invoice resend", "Prepare supporting documents", "Track payment promise", "Other"
+    ], key="ap_action")
+    ap_rationale = st.text_area("Reason for proposed action", max_chars=1500, key="ap_rationale")
+    ap_requester = st.text_input("Requested by (name/team)", max_chars=120, key="ap_requester")
+    if st.button("Submit for approval", type="primary", key="ap_submit"):
+        try:
+            new_id = create_request(ap_invoice, ap_action, ap_rationale, ap_requester)
+            st.success(f"Approval request #{new_id} created.")
+            st.rerun()
+        except Exception as error:  # noqa: BLE001
+            st.error(f"Could not create request: {type(error).__name__}: {error}")
+
+ap_filter = st.selectbox("Approval status filter", ["All", *STATUSES], key="ap_filter")
+try:
+    ap_rows = list_requests(ap_filter)
+    if ap_rows:
+        st.dataframe(pd.DataFrame(ap_rows), use_container_width=True, hide_index=True)
+        pending = [r for r in ap_rows if r["status"] == "Pending"]
+        if pending:
+            st.subheader("Review pending request")
+            ap_id = st.selectbox("Pending request ID", [int(r["id"]) for r in pending], key="ap_id")
+            ap_reviewer = st.text_input("Reviewer name/team", max_chars=120, key="ap_reviewer")
+            ap_comments = st.text_area("Review comments", max_chars=1500, key="ap_comments")
+            ap_decision = st.radio("Decision", ["Approved", "Rejected"], horizontal=True, key="ap_decision")
+            if st.button("Record decision", key="ap_decide"):
+                try:
+                    decide_request(ap_id, ap_decision, ap_reviewer, ap_comments)
+                    st.success(f"Decision for request #{ap_id} recorded.")
+                    st.rerun()
+                except Exception as error:  # noqa: BLE001
+                    st.error(f"Could not record decision: {type(error).__name__}: {error}")
+        st.download_button("Download approval history as CSV",
+            pd.DataFrame(ap_rows).to_csv(index=False).encode("utf-8"),
+            "human_approval_history.csv", "text/csv", key="ap_download")
+    else:
+        st.info("No approval requests match this filter.")
+except Exception as error:  # noqa: BLE001
+    st.error(f"Could not load approval queue: {type(error).__name__}: {error}")
+
+
+
+
+# ------------------------------------------------------------
+# V2.8: Integrated collection workflow (classification -> decision -> task -> approval)
+# ------------------------------------------------------------
+from approval_service import create_request as workflow_create_approval
+from follow_up_service import create_task as workflow_create_task
+
+st.divider()
+st.header("V2.8 — Integrated Collection Workflow")
+st.caption(
+    "Connect a customer-response classification to the deterministic decision rules, "
+    "a follow-up task, and a human approval request. This creates records only; it does not send email or update an ERP."
+)
+
+workflow_invoice = st.selectbox(
+    "Invoice for integrated workflow",
+    options=invoices["invoice_number"].astype(str).tolist(),
+    key="v28_workflow_invoice",
+)
+workflow_row = invoices.loc[invoices["invoice_number"].astype(str) == workflow_invoice].iloc[0]
+workflow_response = st.text_area(
+    "Customer response (optional)",
+    placeholder="Paste the customer's message if one exists. Leave blank to use invoice data only.",
+    max_chars=12000,
+    key="v28_workflow_response",
+)
+workflow_requester = st.text_input(
+    "Workflow requested by (name/team)", max_chars=120, key="v28_workflow_requester"
+)
+workflow_due_date = st.date_input(
+    "Follow-up due date", value=date.today(), key="v28_workflow_due_date"
+)
+if st.button("Run integrated workflow", type="primary", key="v28_run_workflow"):
+    if not workflow_requester.strip():
+        st.error("Enter the requester name or team before creating workflow records.")
+    else:
+        try:
+            workflow_classification = None
+            workflow_category = None
+            if workflow_response.strip():
+                with st.spinner("Classifying customer response..."):
+                    workflow_classification = classify_customer_response(workflow_response.strip())
+                workflow_category = workflow_classification["category"]
+
+            workflow_decision = decide_collection_action(
+                invoice_number=workflow_invoice,
+                outstanding_amount=float(workflow_row["outstanding_amount"]),
+                days_overdue=int(workflow_row["days_overdue"]),
+                dispute_status=workflow_row["dispute_status"],
+                customer_response_category=workflow_category,
+            )
+
+            action_map = {
+                "Dispute review": "Review invoice dispute",
+                "Payment verification": "Verify reported payment",
+                "Invoice resend review": "Resend invoice",
+                "Supporting documents": "Provide supporting documents",
+                "Payment promise tracking": "Review payment promise",
+                "Reminder draft eligible": "Prepare payment reminder",
+                "Monitor": "Contact customer",
+                "No collection required": "Other",
+            }
+            task_type = action_map.get(workflow_decision.decision, "Other")
+            task_description = (
+                f"V2.8 integrated workflow. Decision: {workflow_decision.decision}. "
+                f"Reason: {workflow_decision.reason} Recommended action: {workflow_decision.recommended_action}"
+            )
+            if workflow_classification:
+                task_description += (
+                    f" Customer response category: {workflow_classification['category']}; "
+                    f"sentiment: {workflow_classification['sentiment']}."
+                )
+            # A proposed action is always routed to human review. Reminder eligibility is not sending permission.
+            task_id = workflow_create_task(
+                invoice_number=workflow_invoice,
+                customer_name=str(workflow_row["customer_name"]),
+                task_type=task_type,
+                description=task_description[:1000],
+                due_date=workflow_due_date,
+                status="Awaiting approval",
+                requires_human_review=True,
+            )
+            approval_action = action_map.get(workflow_decision.decision, "Other")
+            approval_rationale = (
+                f"Linked follow-up task ID: {task_id}. Decision: {workflow_decision.decision}. "
+                f"Reason: {workflow_decision.reason} Recommended action: {workflow_decision.recommended_action} "
+                f"Reminder permitted by deterministic rules: {workflow_decision.reminder_allowed}. "
+                "Human review is mandatory; no external action is executed by this workflow."
+            )
+            approval_id = workflow_create_approval(
+                workflow_invoice, approval_action, approval_rationale, workflow_requester.strip()
+            )
+            st.session_state["v28_last_workflow_result"] = {
+                "invoice_number": workflow_invoice,
+                "classification": workflow_classification,
+                "decision": {
+                    "decision": workflow_decision.decision,
+                    "recommended_action": workflow_decision.recommended_action,
+                    "reason": workflow_decision.reason,
+                    "reminder_allowed": workflow_decision.reminder_allowed,
+                    "requires_human_review": True,
+                },
+                "task_id": task_id,
+                "approval_id": approval_id,
+            }
+            st.success(f"Workflow records created: task #{task_id}; approval request #{approval_id}.")
+            st.rerun()
+        except Exception as error:  # noqa: BLE001
+            st.error(
+                "The integrated workflow could not be completed. Check the error and avoid "
+                "re-submitting until you confirm whether any records were created. "
+                f"Error type: {type(error).__name__}: {error}"
+            )
+
+last_workflow_result = st.session_state.get("v28_last_workflow_result")
+if last_workflow_result:
+    with st.expander("Latest integrated workflow result", expanded=True):
+        st.json(last_workflow_result)
+        st.info(
+            "The task and approval request are separate persisted records linked by the task ID in the approval rationale. "
+            "Reviewers must verify both records. The prototype does not automatically synchronize task status after approval."
+        )
+
+
+st.warning("Prototype safety boundary: reviewer identity is not authenticated, role-based permissions are not enforced, and approval records do not execute external actions.")

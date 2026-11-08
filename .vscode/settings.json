@@ -1,0 +1,7 @@
+{
+    "python.analysis.extraPaths": [
+        "./AI Collections Employee - MVP",
+        "./AI Collections Employee - MVP/src/ai_collections_employee_mvp",
+        "./AI Collections Employee - MVP/docs"
+    ]
+}
