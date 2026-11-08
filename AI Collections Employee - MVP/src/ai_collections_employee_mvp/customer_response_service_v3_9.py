@@ -10,10 +10,12 @@ import sqlite3
 import uuid
 from contextlib import closing
 from datetime import datetime, timezone
-from pathlib import Path
+from pathlib import Path  # noqa: F401
 from typing import Any
 
-DB_PATH = Path(__file__).resolve().parent / "collection_workflow.db"
+from database_config import DEFAULT_DB_PATH
+
+DB_PATH = DEFAULT_DB_PATH
 
 CATEGORIES = (
     "Payment promised",
@@ -287,7 +289,10 @@ def save_customer_response(
             ),
         )
 
-        response_id = int(cursor.lastrowid)
+        lastrowid = cursor.lastrowid
+        if lastrowid is None:
+            raise RuntimeError("Failed to retrieve the created customer response ID")
+        response_id = int(lastrowid)
 
     _audit(
         actor,

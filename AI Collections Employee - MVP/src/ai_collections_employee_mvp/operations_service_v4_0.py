@@ -1,9 +1,13 @@
 """V4.0 read-only operational metrics and release-gate reporting."""
 from __future__ import annotations
+
 import sqlite3
-from pathlib import Path
 from datetime import datetime, timezone
-DB_PATH=Path(__file__).resolve().parent/"collection_workflow.db"
+from pathlib import Path  # noqa: F401
+
+from database_config import DEFAULT_DB_PATH
+
+DB_PATH = DEFAULT_DB_PATH
 
 def _connect():
  c=sqlite3.connect(str(DB_PATH),timeout=15); c.row_factory=sqlite3.Row; c.execute("PRAGMA busy_timeout=15000"); return c
@@ -13,7 +17,7 @@ def _table_exists(db,name): return db.execute("SELECT 1 FROM sqlite_master WHERE
 def get_operations_snapshot(actor):
  from secure_workflow_service import require_permission
  require_permission(actor,"view_workflows")
- result={"generated_at":datetime.now(timezone.utc).isoformat(timespec="seconds"),"tables":{},"health":{}}
+ result={"generated_at":datetime.now(timezone.utc).isoformat(timespec="seconds"),"tables":{},"health":{}}  # noqa: UP017
  with _connect() as db:
   result["health"]["integrity_check"]=db.execute("PRAGMA integrity_check").fetchone()[0]
   for table in ("email_drafts","email_send_attempts","approval_requests","workflow_runs","follow_up_tasks","customer_responses","app_users"):

@@ -12,7 +12,9 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable  # noqa: UP035
 
-DB_PATH = Path(__file__).resolve().parent / "collection_workflow.db"
+from database_config import DEFAULT_DB_PATH
+
+DB_PATH = DEFAULT_DB_PATH
 CATEGORIES = [
     "Payment promised", "Payment completed", "Invoice dispute", "Missing invoice",
     "Request for supporting documents", "Payment date requested", "No clear response",
@@ -93,7 +95,9 @@ def run_classification_benchmark(classifier: Callable[[str], dict] | None = None
             "warning":"Small synthetic benchmark; not a production accuracy guarantee. Review every mismatch before any pilot."}
 
 
-def initialize_pilot_log(db_path: str | Path = DB_PATH) -> None:
+def initialize_pilot_log(db_path: str | Path | None = None) -> None:
+    if db_path is None:
+        db_path = DB_PATH
     with sqlite3.connect(str(db_path), timeout=10) as conn:
         conn.execute("""CREATE TABLE IF NOT EXISTS pilot_metric_log (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -113,7 +117,9 @@ def initialize_pilot_log(db_path: str | Path = DB_PATH) -> None:
 def record_pilot_metrics(*, pilot_label: str, sample_size: int, workflow_completed: int,
                          workflow_failed: int, recommendations_accepted: int,
                          recommendations_corrected: int, avg_review_minutes: float | None,
-                         notes: str = "", db_path: str | Path = DB_PATH) -> int:
+                         notes: str = "", db_path: str | Path | None = None) -> int:
+    if db_path is None:
+        db_path = DB_PATH
     """Store aggregate pilot metrics only. Do not put customer names, messages, or invoice data in notes."""
     vals = [sample_size, workflow_completed, workflow_failed, recommendations_accepted, recommendations_corrected]
     if any(not isinstance(v, int) or v < 0 for v in vals):
@@ -138,10 +144,14 @@ def record_pilot_metrics(*, pilot_label: str, sample_size: int, workflow_complet
             (datetime.now(timezone.utc).isoformat(), label, sample_size, workflow_completed,  # noqa: UP017
              workflow_failed, recommendations_accepted, recommendations_corrected, avg_review_minutes, notes.strip()))
         conn.commit()
-        return int(cur.lastrowid)
+        if cur.lastrowid is None:
+            raise RuntimeError("Pilot metric insert did not return a row ID.")
+        return cur.lastrowid
 
 
-def list_pilot_metrics(db_path: str | Path = DB_PATH) -> list[dict[str, Any]]:
+def list_pilot_metrics(db_path: str | Path | None = None) -> list[dict[str, Any]]:
+    if db_path is None:
+        db_path = DB_PATH
     initialize_pilot_log(db_path)
     with sqlite3.connect(str(db_path), timeout=10) as conn:
         conn.row_factory = sqlite3.Row
