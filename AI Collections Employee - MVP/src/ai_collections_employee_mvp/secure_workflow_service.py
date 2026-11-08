@@ -6,14 +6,15 @@ import sqlite3
 import uuid
 from contextlib import closing
 from datetime import datetime, timezone
-from pathlib import Path
 from typing import Any
+
+from database_config import DEFAULT_DB_PATH
 
 from approval_service import initialize as initialize_approvals
 from approval_service import list_requests as _list_requests
 from audit_service import log_event
 
-DB_PATH = Path(__file__).resolve().parent / "collection_workflow.db"
+DB_PATH = DEFAULT_DB_PATH
 
 ROLE_PERMISSIONS: dict[str, set[str]] = {
     "admin": {

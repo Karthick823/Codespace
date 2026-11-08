@@ -10,8 +10,9 @@ import json
 import sqlite3
 import uuid
 from datetime import date, datetime
-from pathlib import Path
 from typing import Any
+
+from database_config import DEFAULT_DB_PATH
 
 from approval_service import list_requests
 from collection_agent_v3_5 import (
@@ -31,7 +32,7 @@ from workflow_reliability_service import (
     resolve_idempotency_key,
 )
 
-DB_PATH = Path(__file__).resolve().parent / "collection_workflow.db"
+DB_PATH = DEFAULT_DB_PATH
 STEP_ORDER = (
     ("retrieve_invoice", "Retrieve invoice details"),
     ("classify_response", "Classify customer response"),

@@ -6,10 +6,11 @@ from __future__ import annotations
 
 import sqlite3
 from datetime import date, datetime
-from pathlib import Path
 from typing import Optional
 
-DB_PATH = Path(__file__).resolve().parent / "collection_workflow.db"
+from database_config import DEFAULT_DB_PATH
+
+DB_PATH = DEFAULT_DB_PATH
 
 TASK_STATUSES = ("Open", "Awaiting approval", "In progress", "Completed", "Cancelled")
 TASK_TYPES = (
