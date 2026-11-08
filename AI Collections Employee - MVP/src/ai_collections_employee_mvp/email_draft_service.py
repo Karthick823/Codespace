@@ -121,6 +121,9 @@ def save_email_draft(actor: dict, invoice_number: str, customer_name: str,
              (draft_uuid, invoice, customer, recipient, subj, content, tone,
               str(recommended_action or "")[:500], actor.get("id"), actor["username"], actor["role"],
               now, now, json_dumps(validation)))
+        if cur.lastrowid is None:
+            db.rollback()
+            raise RuntimeError("Email draft ID was not generated.")
         draft_id = int(cur.lastrowid)
         db.commit()
     _audit(actor, "email_draft_saved", draft_id, invoice, validation)
